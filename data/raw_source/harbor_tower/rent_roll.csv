@@ -1,0 +1,6 @@
+PropCode,TenantName,UnitSqFt,BaseRentPerSF,LeaseFromDate,LeaseToDate,DelinquentFlag
+BLDG-001,Acme Corp,50000,32.50,01/01/2023,01/01/2028,N
+BLDG-001,Beta Analytics,40000,33.00,06/01/2022,06/01/2027,N
+BLDG-001,Gamma Legal LLC,10000,30.00,03/01/2024,12/01/2026,N
+BLDG-001,Delta Capital,8000,35.00,09/01/2023,08/31/2028,N
+BLDG-001,Epsilon Partners,6000,29.50,04/01/2025,03/31/2030,Y

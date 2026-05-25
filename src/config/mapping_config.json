@@ -1,0 +1,111 @@
+{
+  "version": "1.0",
+  "core_schema": {
+    "fields": {
+      "property_id":   { "type": "str",   "required": true },
+      "tenant_name":   { "type": "str",   "required": true },
+      "square_footage":{ "type": "int",   "required": true, "constraints": { "gt": 0 } },
+      "base_rent_psf": { "type": "float", "required": true, "constraints": { "gt": 0 } },
+      "lease_start":   { "type": "date",  "required": true, "format": "YYYY-MM-DD" },
+      "lease_end":     { "type": "date",  "required": true, "format": "YYYY-MM-DD" },
+      "is_delinquent": { "type": "bool",  "required": true }
+    }
+  },
+  "sources": {
+    "yardi": {
+      "description": "Yardi Voyager rent roll CSV export",
+      "date_format": "%m/%d/%Y",
+      "field_map": {
+        "property_id":   "PropCode",
+        "tenant_name":   "TenantName",
+        "square_footage":"UnitSqFt",
+        "base_rent_psf": "BaseRentPerSF",
+        "lease_start":   "LeaseFromDate",
+        "lease_end":     "LeaseToDate",
+        "is_delinquent": "DelinquentFlag"
+      },
+      "value_transforms": {
+        "is_delinquent": {
+          "true_values":  ["Y", "Yes", "1", "TRUE", "true"],
+          "false_values": ["N", "No",  "0", "FALSE","false"]
+        }
+      }
+    },
+    "realpage": {
+      "description": "RealPage IMS rent roll export",
+      "date_format": "%Y-%m-%d",
+      "field_map": {
+        "property_id":   "PropertyID",
+        "tenant_name":   "ResidentName",
+        "square_footage":"SquareFeet",
+        "base_rent_psf": "RentPerSF",
+        "lease_start":   "LeaseStartDate",
+        "lease_end":     "LeaseEndDate",
+        "is_delinquent": "Delinquent"
+      },
+      "value_transforms": {
+        "is_delinquent": {
+          "true_values":  ["true", "True", "1", "yes", "Yes"],
+          "false_values": ["false","False","0", "no",  "No"]
+        }
+      }
+    },
+    "mri": {
+      "description": "MRI Software commercial rent roll export",
+      "date_format": "%d-%b-%Y",
+      "field_map": {
+        "property_id":   "prop_id",
+        "tenant_name":   "lessee_name",
+        "square_footage":"leaseable_area",
+        "base_rent_psf": "rent_psf",
+        "lease_start":   "commence_date",
+        "lease_end":     "expire_date",
+        "is_delinquent": "past_due_flag"
+      },
+      "value_transforms": {
+        "is_delinquent": {
+          "true_values":  ["1", "Y", "true"],
+          "false_values": ["0", "N", "false"]
+        }
+      }
+    },
+    "appfolio": {
+      "description": "AppFolio rent roll spreadsheet export",
+      "date_format": "%m/%d/%Y",
+      "field_map": {
+        "property_id":   "Property",
+        "tenant_name":   "Tenant",
+        "square_footage":"Sq Ft",
+        "base_rent_psf": "Rent/SqFt",
+        "lease_start":   "Lease Start",
+        "lease_end":     "Lease End",
+        "is_delinquent": "Delinquent"
+      },
+      "value_transforms": {
+        "is_delinquent": {
+          "true_values":  ["Yes", "Y", "1", "true"],
+          "false_values": ["No",  "N", "0", "false"]
+        }
+      }
+    },
+    "entrata": {
+      "description": "Entrata property management rent roll export",
+      "date_format": "%Y/%m/%d",
+      "field_map": {
+        "property_id":   "property_code",
+        "tenant_name":   "full_name",
+        "square_footage":"unit_sqft",
+        "base_rent_psf": "base_rent_per_sqft",
+        "lease_start":   "lease_start",
+        "lease_end":     "lease_end",
+        "is_delinquent": "delinquent"
+      },
+      "value_transforms": {
+        "is_delinquent": {
+          "true_values":  ["1", "true", "True", "yes"],
+          "false_values": ["0", "false","False","no"]
+        }
+      }
+    }
+  }
+}

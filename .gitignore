@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Database
+data/secure_vault/portfolio.db
+data/secure_vault/portfolio.db-shm
+data/secure_vault/portfolio.db-wal
+
+# Generated reports
+reports/
+
+# macOS
+.DS_Store
+
+# IDE / tooling
+.claude/
+.vscode/
+.idea/
+
+# Environment
+.env
