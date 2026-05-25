@@ -38,6 +38,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+import copy
+
 import pandas as pd
 
 from src.analytics.asset_manager import AssetManager
@@ -321,6 +323,54 @@ def _print_summary_table(results: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-property config resolver
+# ---------------------------------------------------------------------------
+
+_DEFAULT_ASSUMPTIONS: dict[str, float] = {
+    "rent_growth":   0.025,
+    "vacancy_rate":  0.050,
+    "exit_cap_rate": 0.0625,
+    "discount_rate": 0.090,
+    "ltv":           0.65,
+    "interest_rate": 0.065,
+}
+
+
+def _resolve_prop_cfg(
+    prop_id:     str,
+    mapping_cfg: dict,
+    args:        argparse.Namespace,
+) -> tuple[str, dict]:
+    """
+    Return (source_format, assumptions) for *prop_id*.
+
+    Checks mapping_cfg for a property-level entry keyed by prop_id.
+    Falls back to the --format CLI flag and sensible market defaults when
+    no property-specific block exists so the pipeline never KeyErrors on
+    an unknown directory name.
+    """
+    prop_cfg = mapping_cfg.get(prop_id, {})
+    fmt = prop_cfg.get("source_format", args.format)
+
+    assumptions = {
+        k: prop_cfg.get(k, getattr(args, k, _DEFAULT_ASSUMPTIONS[k]))
+        for k in _DEFAULT_ASSUMPTIONS
+    }
+    return fmt, assumptions
+
+
+def _apply_assumptions(
+    args:      argparse.Namespace,
+    overrides: dict,
+) -> argparse.Namespace:
+    """Return a shallow copy of *args* with *overrides* applied."""
+    patched = copy.copy(args)
+    for k, v in overrides.items():
+        setattr(patched, k, v)
+    return patched
+
+
+# ---------------------------------------------------------------------------
 # Pipeline orchestrator
 # ---------------------------------------------------------------------------
 
@@ -405,12 +455,22 @@ def run_pipeline(args: argparse.Namespace) -> int:
     for pid, recs in grouped.items():
         print(f"    • {pid}  ({len(recs)} leases)")
 
+    # Resolve per-property format + underwriting assumptions once.
+    # Falls back to CLI flags and _DEFAULT_ASSUMPTIONS for any property
+    # not explicitly listed in mapping_config.json.
+    prop_configs: dict[str, tuple[str, dict]] = {
+        pid: _resolve_prop_cfg(pid, mapping_cfg, args)
+        for pid in grouped
+    }
+
     # ── 5. Upsert properties + load leases ────────────────────────────
     print()
     print("  Loading data to database …")
     for pid, records in grouped.items():
         try:
-            _upsert_property(pid, records, session_fac, args)
+            _, assumptions = prop_configs[pid]
+            prop_args = _apply_assumptions(args, assumptions)
+            _upsert_property(pid, records, session_fac, prop_args)
             n = _load_leases_to_db(pid, records, db_path)
             if args.verbose:
                 print(f"    {pid}: {n} lease rows written")
@@ -422,7 +482,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
     assets: dict[str, Asset] = {}
     for pid, records in grouped.items():
         try:
-            assets[pid] = _build_asset(pid, records, session_fac, args)
+            _, assumptions = prop_configs[pid]
+            prop_args = _apply_assumptions(args, assumptions)
+            assets[pid] = _build_asset(pid, records, session_fac, prop_args)
         except Exception as exc:
             print(f"  WARNING: Could not build Asset for {pid} — {exc}")
 
