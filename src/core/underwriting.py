@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -86,6 +87,61 @@ def _irr(
 
 
 # ---------------------------------------------------------------------------
+# Lease escalation engine
+# ---------------------------------------------------------------------------
+
+_FIXED_RATE_RE = re.compile(r"fixed[- ](\d+(?:\.\d+)?)%", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class LeaseInfo:
+    """Per-lease descriptor consumed by the pro forma engine."""
+    tenant_name:     str
+    square_footage:  int
+    base_rent_psf:   float
+    escalation_type: str = ""
+
+
+def _escalate_rent_psf(
+    base_psf:          float,
+    escalation_type:   str,
+    year:              int,
+    general_inflation: float,
+    fallback_rate:     float = 0.030,
+) -> float:
+    """
+    Return the rent PSF for *year* given a lease's escalation clause.
+
+    Dispatch table
+    --------------
+    Fixed-X%     compound at X%/yr from Year 1
+    CPI-Linked   compound at general_inflation/yr
+    Stepped-Jump flat until Year 4; +$2.00 PSF from Year 5 onward
+    None         flat for all years
+    (empty)      no explicit clause — fall back to property-level fallback_rate
+    """
+    esc   = (escalation_type or "").strip()
+    lower = esc.lower()
+
+    m = _FIXED_RATE_RE.match(esc)
+    if m:
+        rate = float(m.group(1)) / 100.0
+        return base_psf * (1 + rate) ** (year - 1)
+
+    if lower == "cpi-linked":
+        return base_psf * (1 + general_inflation) ** (year - 1)
+
+    if lower == "stepped-jump":
+        return base_psf + (2.00 if year >= 5 else 0.0)
+
+    if lower == "none":
+        return base_psf
+
+    # Empty string — escalation type not supplied in source data
+    return base_psf * (1 + fallback_rate) ** (year - 1)
+
+
+# ---------------------------------------------------------------------------
 # Result containers
 # ---------------------------------------------------------------------------
 
@@ -158,6 +214,13 @@ class Asset(ABC):
     # Capital reserves (used by subclasses; stored here so base helpers can reach it)
     capex_reserve_psf: float = 1.00
 
+    # Inflation / CPI assumption — drives CPI-Linked lease escalations
+    general_inflation: float = 0.025
+
+    # Per-lease escalation schedule; when populated, overrides the blended
+    # base_rent_psf × rent_escalation_rate approach
+    lease_schedule: list[LeaseInfo] = field(default_factory=list)
+
     # Exit assumption
     exit_cap_rate: float = 0.0   # must be overridden; validated in __post_init__
 
@@ -201,6 +264,28 @@ class Asset(ABC):
             self._loan_amount, self.debt_interest_rate, self.amortization_years
         ) * 12
 
+    def _compute_gpr(self, year: int) -> float:
+        """
+        Gross Potential Rent for *year*.
+
+        When lease_schedule is populated each tenant's rent is escalated
+        independently via _escalate_rent_psf, then summed to a property total.
+        When it is empty the legacy blended-PSF path is used, preserving
+        backward compatibility for assets built without per-lease data.
+        """
+        if self.lease_schedule:
+            return sum(
+                _escalate_rent_psf(
+                    lease.base_rent_psf,
+                    lease.escalation_type,
+                    year,
+                    self.general_inflation,
+                    self.rent_escalation_rate,
+                ) * lease.square_footage
+                for lease in self.lease_schedule
+            )
+        return self.base_rent_psf * (1 + self.rent_escalation_rate) ** (year - 1) * self.total_sqft
+
     # ------------------------------------------------------------------
     # Abstract hook
     # ------------------------------------------------------------------
@@ -236,8 +321,8 @@ class Asset(ABC):
         output: list[ProFormaYear] = []
 
         for yr in range(1, 11):
-            rent_psf = self.base_rent_psf * (1 + self.rent_escalation_rate) ** (yr - 1)
-            pgi      = rent_psf * self.total_sqft
+            pgi      = self._compute_gpr(yr)
+            rent_psf = pgi / self.total_sqft   # blended weighted-avg PSF for reporting
             vac      = pgi * self.vacancy_rate
             crd      = pgi * self.credit_loss_rate
             egi      = pgi - vac - crd
@@ -274,13 +359,12 @@ class Asset(ABC):
         Expenses are escalated by the same logic as the hold-period years so the
         terminal NOI margin is internally consistent.
         """
-        yr       = 11
-        rent_psf = self.base_rent_psf * (1 + self.rent_escalation_rate) ** (yr - 1)
-        pgi      = rent_psf * self.total_sqft
-        vac      = pgi * self.vacancy_rate
-        crd      = pgi * self.credit_loss_rate
-        egi      = pgi - vac - crd
-        opex     = self._compute_operating_expenses(year=yr, pgi=pgi, egi=egi)
+        yr   = 11
+        pgi  = self._compute_gpr(yr)
+        vac  = pgi * self.vacancy_rate
+        crd  = pgi * self.credit_loss_rate
+        egi  = pgi - vac - crd
+        opex = self._compute_operating_expenses(year=yr, pgi=pgi, egi=egi)
         return egi - opex
 
     # ------------------------------------------------------------------

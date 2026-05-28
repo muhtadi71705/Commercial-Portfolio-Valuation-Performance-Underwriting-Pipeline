@@ -16,13 +16,14 @@
       "description": "Yardi Voyager rent roll CSV export",
       "date_format": "%m/%d/%Y",
       "field_map": {
-        "property_id":   "PropCode",
-        "tenant_name":   "TenantName",
-        "square_footage":"UnitSqFt",
-        "base_rent_psf": "BaseRentPerSF",
-        "lease_start":   "LeaseFromDate",
-        "lease_end":     "LeaseToDate",
-        "is_delinquent": "DelinquentFlag"
+        "property_id":    "PropCode",
+        "tenant_name":    "TenantName",
+        "square_footage": "UnitSqFt",
+        "base_rent_psf":  "BaseRentPerSF",
+        "lease_start":    "LeaseFromDate",
+        "lease_end":      "LeaseToDate",
+        "is_delinquent":  "DelinquentFlag",
+        "escalation_type":"Escalation_Type"
       },
       "value_transforms": {
         "is_delinquent": {
@@ -35,13 +36,14 @@
       "description": "RealPage IMS rent roll export",
       "date_format": "%Y-%m-%d",
       "field_map": {
-        "property_id":   "PropertyID",
-        "tenant_name":   "ResidentName",
-        "square_footage":"SquareFeet",
-        "base_rent_psf": "RentPerSF",
-        "lease_start":   "LeaseStartDate",
-        "lease_end":     "LeaseEndDate",
-        "is_delinquent": "Delinquent"
+        "property_id":    "PropertyID",
+        "tenant_name":    "ResidentName",
+        "square_footage": "SquareFeet",
+        "base_rent_psf":  "RentPerSF",
+        "lease_start":    "LeaseStartDate",
+        "lease_end":      "LeaseEndDate",
+        "is_delinquent":  "Delinquent",
+        "escalation_type":"EscalationType"
       },
       "value_transforms": {
         "is_delinquent": {
@@ -54,13 +56,14 @@
       "description": "MRI Software commercial rent roll export",
       "date_format": "%d-%b-%Y",
       "field_map": {
-        "property_id":   "prop_id",
-        "tenant_name":   "lessee_name",
-        "square_footage":"leaseable_area",
-        "base_rent_psf": "rent_psf",
-        "lease_start":   "commence_date",
-        "lease_end":     "expire_date",
-        "is_delinquent": "past_due_flag"
+        "property_id":    "prop_id",
+        "tenant_name":    "lessee_name",
+        "square_footage": "leaseable_area",
+        "base_rent_psf":  "rent_psf",
+        "lease_start":    "commence_date",
+        "lease_end":      "expire_date",
+        "is_delinquent":  "past_due_flag",
+        "escalation_type":"escalation_type"
       },
       "value_transforms": {
         "is_delinquent": {
@@ -73,13 +76,14 @@
       "description": "AppFolio rent roll spreadsheet export",
       "date_format": "%m/%d/%Y",
       "field_map": {
-        "property_id":   "Property",
-        "tenant_name":   "Tenant",
-        "square_footage":"Sq Ft",
-        "base_rent_psf": "Rent/SqFt",
-        "lease_start":   "Lease Start",
-        "lease_end":     "Lease End",
-        "is_delinquent": "Delinquent"
+        "property_id":    "Property",
+        "tenant_name":    "Tenant",
+        "square_footage": "Sq Ft",
+        "base_rent_psf":  "Rent/SqFt",
+        "lease_start":    "Lease Start",
+        "lease_end":      "Lease End",
+        "is_delinquent":  "Delinquent",
+        "escalation_type":"Escalation Type"
       },
       "value_transforms": {
         "is_delinquent": {
@@ -92,13 +96,14 @@
       "description": "Entrata property management rent roll export",
       "date_format": "%Y/%m/%d",
       "field_map": {
-        "property_id":   "property_code",
-        "tenant_name":   "full_name",
-        "square_footage":"unit_sqft",
-        "base_rent_psf": "base_rent_per_sqft",
-        "lease_start":   "lease_start",
-        "lease_end":     "lease_end",
-        "is_delinquent": "delinquent"
+        "property_id":    "property_code",
+        "tenant_name":    "full_name",
+        "square_footage": "unit_sqft",
+        "base_rent_psf":  "base_rent_per_sqft",
+        "lease_start":    "lease_start",
+        "lease_end":      "lease_end",
+        "is_delinquent":  "delinquent",
+        "escalation_type":"escalation_type"
       },
       "value_transforms": {
         "is_delinquent": {

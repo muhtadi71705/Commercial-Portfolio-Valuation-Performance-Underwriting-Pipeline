@@ -45,7 +45,7 @@ import pandas as pd
 from src.analytics.asset_manager import AssetManager
 from src.config.loader import BatchResult, load_mapping_config, validate_batch
 from src.config.schemas import LeaseRecord
-from src.core.underwriting import CommercialAsset, MultifamilyAsset, Asset
+from src.core.underwriting import CommercialAsset, MultifamilyAsset, Asset, LeaseInfo
 from src.database.db_manager import (
     Lease,
     Property,
@@ -260,6 +260,7 @@ def _build_asset(
         total_sqft           = total_sqft,
         base_rent_psf        = base_rent_psf,
         rent_escalation_rate = args.rent_growth,
+        general_inflation    = args.rent_growth,
         vacancy_rate         = args.vacancy_rate,
         credit_loss_rate     = 0.010,
         exit_cap_rate        = exit_cap,
@@ -267,6 +268,15 @@ def _build_asset(
         debt_interest_rate   = args.interest_rate,
         amortization_years   = 30,
         discount_rate        = args.discount_rate,
+        lease_schedule       = [
+            LeaseInfo(
+                tenant_name     = r.tenant_name,
+                square_footage  = r.square_footage,
+                base_rent_psf   = r.base_rent_psf,
+                escalation_type = r.escalation_type,
+            )
+            for r in records
+        ],
     )
 
     if asset_class == "multifamily":

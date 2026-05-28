@@ -27,14 +27,16 @@ def load_mapping_config(path: Path = _CONFIG_PATH) -> dict:
 # ---------------------------------------------------------------------------
 
 def _map_fields(raw: dict[str, Any], field_map: dict[str, str]) -> dict[str, Any]:
-    """Remap source-specific column names to core schema names."""
+    """Remap source-specific column names to core schema names.
+
+    Fields whose source column is absent from the row are silently skipped;
+    Pydantic will apply the schema default for any optional field, or raise a
+    validation error if the field is truly required.
+    """
     mapped: dict[str, Any] = {}
     for core_field, source_field in field_map.items():
         if source_field not in raw:
-            raise KeyError(
-                f"Expected source field '{source_field}' (maps to '{core_field}') not found in row. "
-                f"Available keys: {list(raw.keys())}"
-            )
+            continue   # optional field missing from this source — let Pydantic use default
         mapped[core_field] = raw[source_field]
     return mapped
 

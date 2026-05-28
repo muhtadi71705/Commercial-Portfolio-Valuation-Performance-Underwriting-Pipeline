@@ -9,13 +9,14 @@ PositiveFloat = Annotated[float, Field(gt=0)]
 
 
 class LeaseRecord(BaseModel):
-    property_id:    str
-    tenant_name:    str
-    square_footage: PositiveInt
-    base_rent_psf:  PositiveFloat
-    lease_start:    date
-    lease_end:      date
-    is_delinquent:  bool
+    property_id:     str
+    tenant_name:     str
+    square_footage:  PositiveInt
+    base_rent_psf:   PositiveFloat
+    lease_start:     date
+    lease_end:       date
+    is_delinquent:   bool
+    escalation_type: str = ""
 
     @model_validator(mode="after")
     def _lease_end_after_start(self) -> "LeaseRecord":
