@@ -23,7 +23,8 @@
         "lease_start":    "LeaseFromDate",
         "lease_end":      "LeaseToDate",
         "is_delinquent":  "DelinquentFlag",
-        "escalation_type":"Escalation_Type"
+        "escalation_type":"Escalation_Type",
+        "recovery_type":  "Recovery_Type"
       },
       "value_transforms": {
         "is_delinquent": {

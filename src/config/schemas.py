@@ -17,6 +17,7 @@ class LeaseRecord(BaseModel):
     lease_end:       date
     is_delinquent:   bool
     escalation_type: str = ""
+    recovery_type:   str = ""
 
     @model_validator(mode="after")
     def _lease_end_after_start(self) -> "LeaseRecord":

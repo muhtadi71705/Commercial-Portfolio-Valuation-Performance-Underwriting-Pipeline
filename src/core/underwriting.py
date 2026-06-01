@@ -100,6 +100,7 @@ class LeaseInfo:
     square_footage:  int
     base_rent_psf:   float
     escalation_type: str = ""
+    recovery_type:   str = ""    # NNN | Base-Year-Stop | (empty = gross lease)
 
 
 def _escalate_rent_psf(
@@ -150,14 +151,15 @@ def _escalate_rent_psf(
 class ProFormaYear:
     year:                    int
     rent_psf:                float
-    potential_gross_income:  float   # PGI  = rent_psf × sqft
-    vacancy_loss:            float   # PGI  × vacancy_rate
-    credit_loss:             float   # PGI  × credit_loss_rate
-    effective_gross_income:  float   # EGI  = PGI - vacancy - credit
-    operating_expenses:      float   # landlord's net OpEx burden (subclass-defined)
-    net_operating_income:    float   # NOI  = EGI - OpEx
+    potential_gross_income:  float   # PGI   = base rent GPR
+    vacancy_loss:            float   # PGI   × vacancy_rate
+    credit_loss:             float   # PGI   × credit_loss_rate
+    expense_reimbursement:   float   # NNN / Base-Year-Stop recovery from tenants
+    effective_gross_income:  float   # EGI   = PGI - vacancy - credit + reimbursement
+    operating_expenses:      float   # total landlord OpEx burden (pre-recovery)
+    net_operating_income:    float   # NOI   = EGI - OpEx
     debt_service:            float   # annual P&I on acquisition loan
-    levered_net_cash_flow:   float   # LNCF = NOI - DS
+    levered_net_cash_flow:   float   # LNCF  = NOI - DS
 
 
 @dataclass(frozen=True)
@@ -186,16 +188,18 @@ class Asset(ABC):
     """
     Base class for all underwritten real estate assets.
 
-    Projection waterfall (identical across subtypes):
-        PGI  →  less Vacancy Loss  →  less Credit Loss
-             =  EGI
-             →  less Operating Expenses  (subclass-specific landlord burden)
-             =  NOI
-             →  less Annual Debt Service (amortizing at debt_interest_rate on LTV)
-             =  Levered Net Cash Flow
+    Projection waterfall:
+        Base Rent GPR  →  less Vacancy Loss  →  less Credit Loss
+                       +   Expense Reimbursement Revenue (subclass hook)
+                       =   EGI
+                       →   less Total Operating Expenses
+                       =   NOI
+                       →   less Annual Debt Service
+                       =   Levered Net Cash Flow
 
-    Subclasses implement _compute_operating_expenses() to encode their lease
-    structure (NNN pass-throughs vs. full gross-lease expense burden).
+    Subclasses implement _compute_operating_expenses() for their total OpEx stack
+    and _compute_expense_reimbursements() for how much of that OpEx is recovered
+    from tenants under NNN or Base-Year-Stop structures.
     """
 
     # Identity
@@ -287,6 +291,27 @@ class Asset(ABC):
         return self.base_rent_psf * (1 + self.rent_escalation_rate) ** (year - 1) * self.total_sqft
 
     # ------------------------------------------------------------------
+    # Expense recovery hook (override in subclasses that support it)
+    # ------------------------------------------------------------------
+
+    def _compute_expense_reimbursements(
+        self, year: int, total_opex: float, base_year_opex: float
+    ) -> float:
+        """
+        Return the total expense reimbursement revenue collected from tenants.
+
+        Base implementation returns 0.0 (gross lease — landlord absorbs all OpEx).
+        CommercialAsset overrides this to implement NNN and Base-Year-Stop structures.
+
+        Parameters
+        ----------
+        year           : projection year (1-based)
+        total_opex     : full operating expenses for this year (pre-recovery)
+        base_year_opex : Year 1 operating expenses — the Base-Year-Stop threshold
+        """
+        return 0.0
+
+    # ------------------------------------------------------------------
     # Abstract hook
     # ------------------------------------------------------------------
 
@@ -317,18 +342,31 @@ class Asset(ABC):
         Returns a list of immutable ProFormaYear records — one per projection year.
         Pass this list directly to calculate_dcf().
         """
-        ds     = self._annual_debt_service
+        ds             = self._annual_debt_service
+        base_year_opex = 0.0
         output: list[ProFormaYear] = []
 
         for yr in range(1, 11):
             pgi      = self._compute_gpr(yr)
-            rent_psf = pgi / self.total_sqft   # blended weighted-avg PSF for reporting
+            rent_psf = pgi / self.total_sqft
+
+            # Vacancy and credit loss applied to base rent only
             vac      = pgi * self.vacancy_rate
             crd      = pgi * self.credit_loss_rate
-            egi      = pgi - vac - crd
-            opex     = self._compute_operating_expenses(year=yr, pgi=pgi, egi=egi)
-            noi      = egi - opex
-            lncf     = noi - ds
+            base_egi = pgi - vac - crd
+
+            # OpEx computed on base-rent EGI to avoid circular dependency with
+            # the management fee — reimbursements are not subject to the mgmt %
+            opex = self._compute_operating_expenses(year=yr, pgi=pgi, egi=base_egi)
+
+            if yr == 1:
+                base_year_opex = opex
+
+            # Tenant expense recoveries added on top of base rent revenue
+            reimb = self._compute_expense_reimbursements(yr, opex, base_year_opex)
+            egi   = base_egi + reimb
+            noi   = egi - opex
+            lncf  = noi - ds
 
             output.append(ProFormaYear(
                 year                   = yr,
@@ -336,6 +374,7 @@ class Asset(ABC):
                 potential_gross_income = round(pgi,      2),
                 vacancy_loss           = round(vac,      2),
                 credit_loss            = round(crd,      2),
+                expense_reimbursement  = round(reimb,    2),
                 effective_gross_income = round(egi,      2),
                 operating_expenses     = round(opex,     2),
                 net_operating_income   = round(noi,      2),
@@ -359,13 +398,15 @@ class Asset(ABC):
         Expenses are escalated by the same logic as the hold-period years so the
         terminal NOI margin is internally consistent.
         """
-        yr   = 11
-        pgi  = self._compute_gpr(yr)
-        vac  = pgi * self.vacancy_rate
-        crd  = pgi * self.credit_loss_rate
-        egi  = pgi - vac - crd
-        opex = self._compute_operating_expenses(year=yr, pgi=pgi, egi=egi)
-        return egi - opex
+        yr       = 11
+        pgi      = self._compute_gpr(yr)
+        vac      = pgi * self.vacancy_rate
+        crd      = pgi * self.credit_loss_rate
+        base_egi = pgi - vac - crd
+        opex     = self._compute_operating_expenses(year=yr, pgi=pgi, egi=base_egi)
+        base_year_opex = _pro_forma[0].operating_expenses if _pro_forma else 0.0
+        reimb    = self._compute_expense_reimbursements(yr, opex, base_year_opex)
+        return (base_egi + reimb) - opex
 
     # ------------------------------------------------------------------
     # DCF / terminal value
@@ -457,7 +498,7 @@ class CommercialAsset(Asset):
     to gross-lease alternatives of identical rent.
     """
 
-    management_fee_rate: float = 0.040   # % of EGI paid to third-party manager
+    management_fee_rate: float = 0.040   # % of base-rent EGI paid to third-party manager
     expense_growth_rate: float = 0.020   # annual CapEx reserve inflation factor
 
     def _compute_operating_expenses(self, year: int, pgi: float, egi: float) -> float:
@@ -468,6 +509,34 @@ class CommercialAsset(Asset):
             * (1 + self.expense_growth_rate) ** (year - 1)
         )
         return mgmt_fee + capex_rsrv
+
+    def _compute_expense_reimbursements(
+        self, year: int, total_opex: float, base_year_opex: float
+    ) -> float:
+        """
+        Aggregate tenant expense reimbursements for *year*.
+
+        NNN          — tenant pays pro-rata share of total OpEx every year.
+        Base-Year-Stop — tenant pays pro-rata share of the OpEx *increase* above
+                         the Year 1 baseline; $0 if OpEx has not exceeded baseline.
+        All other    — no reimbursement (gross lease treatment).
+
+        Pro-rata share = Tenant SF / Total Asset SF.
+        """
+        if not self.lease_schedule:
+            return 0.0
+
+        reimb = 0.0
+        for lease in self.lease_schedule:
+            rt       = (lease.recovery_type or "").strip().upper()
+            pro_rata = lease.square_footage / self.total_sqft
+
+            if rt == "NNN":
+                reimb += pro_rata * total_opex
+            elif rt == "BASE-YEAR-STOP":
+                reimb += pro_rata * max(0.0, total_opex - base_year_opex)
+
+        return reimb
 
 
 # ---------------------------------------------------------------------------
@@ -516,16 +585,17 @@ def pro_forma_to_dataframe(pro_forma: list[ProFormaYear]) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
-                "Year":                       y.year,
-                "Rent PSF ($)":               y.rent_psf,
-                "Potential Gross Income ($)": y.potential_gross_income,
-                "Vacancy Loss ($)":           y.vacancy_loss,
-                "Credit Loss ($)":            y.credit_loss,
-                "Effective Gross Income ($)": y.effective_gross_income,
-                "Operating Expenses ($)":     y.operating_expenses,
-                "Net Operating Income ($)":   y.net_operating_income,
-                "Debt Service ($)":           y.debt_service,
-                "Levered Net Cash Flow ($)":  y.levered_net_cash_flow,
+                "Year":                          y.year,
+                "Rent PSF ($)":                  y.rent_psf,
+                "Potential Gross Income ($)":    y.potential_gross_income,
+                "Vacancy Loss ($)":              y.vacancy_loss,
+                "Credit Loss ($)":               y.credit_loss,
+                "Expense Reimbursement ($)":     y.expense_reimbursement,
+                "Effective Gross Income ($)":    y.effective_gross_income,
+                "Operating Expenses ($)":        y.operating_expenses,
+                "Net Operating Income ($)":      y.net_operating_income,
+                "Debt Service ($)":              y.debt_service,
+                "Levered Net Cash Flow ($)":     y.levered_net_cash_flow,
             }
             for y in pro_forma
         ]

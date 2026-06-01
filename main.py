@@ -274,6 +274,7 @@ def _build_asset(
                 square_footage  = r.square_footage,
                 base_rent_psf   = r.base_rent_psf,
                 escalation_type = r.escalation_type,
+                recovery_type   = r.recovery_type,
             )
             for r in records
         ],
