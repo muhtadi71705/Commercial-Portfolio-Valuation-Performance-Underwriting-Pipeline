@@ -46,6 +46,7 @@ from src.analytics.asset_manager import AssetManager
 from src.config.loader import BatchResult, load_mapping_config, validate_batch
 from src.config.schemas import LeaseRecord
 from src.core.underwriting import CommercialAsset, MultifamilyAsset, Asset, LeaseInfo
+from src.core.waterfall import WaterfallResult, run_waterfall
 from src.database.db_manager import (
     Lease,
     Property,
@@ -514,9 +515,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     for pid, asset in assets.items():
         try:
-            pf     = asset.generate_10_year_pro_forma()
-            dcf    = asset.calculate_dcf(pf)
-            report = manager.generate_property_report(pid, as_of=date.today())
+            pf        = asset.generate_10_year_pro_forma()
+            dcf       = asset.calculate_dcf(pf)
+            report    = manager.generate_property_report(pid, as_of=date.today())
+            waterfall = run_waterfall(list(dcf.equity_cash_flows))
 
             pdf_path = output_dir / f"{pid}_ICM_{date.today().strftime('%Y%m%d')}.pdf"
             memo = ICMemorandum(
@@ -524,6 +526,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 pro_forma     = pf,
                 dcf           = dcf,
                 report        = report,
+                waterfall     = waterfall,
                 prepared_by   = "CRE-Val Platform",
             )
             memo.build(pdf_path)
@@ -544,8 +547,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
             alerts = report.get("alerts", [])
             icon   = _SEV_ICON.get(status, "?")
             print(f"  {icon} {pid}")
-            print(f"      IRR {dcf.irr:.2%}  ·  DSCR {dcf.dscr_year_1:.2f}x  ·  "
+            print(f"      Combined  IRR {dcf.irr:.2%}  ·  DSCR {dcf.dscr_year_1:.2f}x  ·  "
                   f"NPV ${dcf.npv:,.0f}  ·  EM {dcf.equity_multiple:.2f}x")
+            print(f"      LP (90%)  IRR {waterfall.lp_irr:.2%}  ·  EM {waterfall.lp_equity_multiple:.2f}x  "
+                  f"  |  GP (10%)  IRR {waterfall.gp_irr:.2%}  ·  EM {waterfall.gp_equity_multiple:.2f}x")
             if alerts:
                 for a in alerts:
                     sev = a["severity"]

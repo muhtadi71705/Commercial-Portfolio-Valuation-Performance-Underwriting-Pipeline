@@ -165,14 +165,15 @@ class ProFormaYear:
 @dataclass(frozen=True)
 class DCFResult:
     equity_invested:        float
+    equity_cash_flows:      tuple[float, ...]   # Full equity stream t=0..10 (used by waterfall)
     levered_cash_flows:     tuple[float, ...]   # Years 1-10 LNCF
     terminal_noi:           float               # Year 11 NOI (reversion anchor)
     exit_value:             float               # terminal_noi / exit_cap_rate
     loan_balance_at_exit:   float               # outstanding principal at Year 10
-    net_exit_proceeds:      float               # exit_value − loan_balance_at_exit
+    net_exit_proceeds:      float               # exit_value - loan_balance_at_exit
     npv:                    float               # NPV at discount_rate
     irr:                    float               # levered IRR
-    equity_multiple:        float               # Σ positive CFs / equity_invested
+    equity_multiple:        float               # sum(positive CFs) / equity_invested
     year_1_cap_rate:        float               # going-in cap: Y1 NOI / purchase_price
     debt_yield:             float               # Y1 NOI / loan_amount
     dscr_year_1:            float               # Y1 NOI / annual_debt_service
@@ -458,6 +459,7 @@ class Asset(ABC):
 
         return DCFResult(
             equity_invested      = round(equity,       2),
+            equity_cash_flows    = tuple(equity_cfs),
             levered_cash_flows   = tuple(lncf_list),
             terminal_noi         = round(y11_noi,      2),
             exit_value           = round(exit_val,     2),

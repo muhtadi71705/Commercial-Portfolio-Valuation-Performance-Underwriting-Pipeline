@@ -26,6 +26,7 @@ import matplotlib.ticker as mticker
 from fpdf import FPDF
 
 from src.core.underwriting import Asset, DCFResult, ProFormaYear
+from src.core.waterfall import WaterfallResult
 
 matplotlib.use("Agg")   # headless; no display needed
 
@@ -207,6 +208,7 @@ class ICMemorandum:
         pro_forma:     list[ProFormaYear],
         dcf:           DCFResult,
         report:        dict[str, Any],
+        waterfall:     WaterfallResult | None = None,
         property_name: str | None = None,
         prepared_by:   str = "CRE-Val Platform",
     ) -> None:
@@ -214,6 +216,7 @@ class ICMemorandum:
         self._pf       = pro_forma
         self._dcf      = dcf
         self._report   = report
+        self._wf       = waterfall
         self._name     = property_name or report.get("property_name") or asset.property_id
         self._by       = prepared_by
         self._ac       = (report.get("asset_class") or "commercial").title()
@@ -514,6 +517,83 @@ class ICMemorandum:
             pdf.cell(col2, row_h, v, fill=fill, border=0, align="R")
             pdf.set_text_color(*BLACK)
             pdf.ln()
+
+        # ── equity waterfall ───────────────────────────────────────────
+        if self._wf:
+            wf = self._wf
+            pdf.ln(4)
+            self._hline(pdf.get_y())
+            pdf.ln(2)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(*NAVY)
+            pdf.cell(BODY_W, 5, "EQUITY WATERFALL  (90% LP / 10% GP  |  Hurdles: 8% / 12%)", align="L")
+            pdf.ln(7)
+
+            # two-column side-by-side: LP left, GP right
+            half  = BODY_W / 2 - 3
+            wrow  = 6.0
+            lx    = MARGIN
+            rx    = MARGIN + half + 6
+
+            def _wf_header(x: float, label: str) -> None:
+                pdf.set_xy(x, pdf.get_y())
+                pdf.set_fill_color(*NAVY)
+                pdf.set_text_color(*WHITE)
+                pdf.set_font("Helvetica", "B", 8)
+                pdf.cell(half, wrow, label, fill=True, border=0, align="C")
+
+            row_y = pdf.get_y()
+            _wf_header(lx, "INVESTOR  (LP  90%)")
+            pdf.set_xy(rx, row_y)
+            _wf_header(rx, "SPONSOR   (GP  10%)")
+            pdf.ln()
+
+            lp_rows = [
+                ("LP Equity",    _dollar(wf.lp_equity)),
+                ("LP IRR",       _pct(wf.lp_irr)),
+                ("LP Eq. Multiple", _x(wf.lp_equity_multiple)),
+                ("LP Distributions", _dollar(wf.lp_distributions)),
+            ]
+            gp_rows = [
+                ("GP Equity",    _dollar(wf.gp_equity)),
+                ("GP IRR",       _pct(wf.gp_irr)),
+                ("GP Eq. Multiple", _x(wf.gp_equity_multiple)),
+                ("GP Distributions", _dollar(wf.gp_distributions)),
+            ]
+
+            for i, ((lk, lv), (rk, rv)) in enumerate(zip(lp_rows, gp_rows)):
+                row_y = pdf.get_y()
+                fill  = (i % 2 == 0)
+                if fill:
+                    pdf.set_fill_color(*LIGHT)
+                    pdf.rect(lx, row_y, half, wrow, style="F")
+                    pdf.rect(rx, row_y, half, wrow, style="F")
+                irr_row = (lk == "LP IRR" or rk == "GP IRR")
+                lv_col  = GREEN if (irr_row and wf.lp_irr  >= 0) else BLACK
+                rv_col  = GREEN if (irr_row and wf.gp_irr  >= 0) else BLACK
+                self._kv_row(lx, row_y, half, wrow, lk, lv)
+                pdf.set_text_color(*lv_col)
+                self._kv_row(rx, row_y, half, wrow, rk, rv)
+                pdf.set_text_color(*rv_col)
+                pdf.set_xy(lx, row_y + wrow)
+
+            # tier distribution summary
+            pdf.ln(2)
+            tier_y = pdf.get_y()
+            pdf.set_fill_color(*LIGHT)
+            pdf.rect(lx, tier_y, BODY_W, wrow, style="F")
+            t_col = BODY_W / 3
+            tiers = [
+                (f"Tier 1 (0-8%)   {_dollar(wf.tier1_distributed)}",  0),
+                (f"Tier 2 (8-12%)  {_dollar(wf.tier2_distributed)}",  1),
+                (f"Tier 3 (12%+)   {_dollar(wf.tier3_distributed)}",  2),
+            ]
+            for label, col in tiers:
+                pdf.set_xy(lx + col * t_col, tier_y)
+                pdf.set_font("Helvetica", "", 7.5)
+                pdf.set_text_color(*MUTED)
+                pdf.cell(t_col, wrow, label, align="C")
+            pdf.ln(wrow + 3)
 
         # ── lease roll ─────────────────────────────────────────────────
         lease_roll = self._report.get("lease_roll", [])
