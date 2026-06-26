@@ -171,6 +171,203 @@ _VALID_TABLES = set(_REQUIRED_COLUMNS.keys())
 
 
 # ---------------------------------------------------------------------------
+# Analytical view names (exported for callers that query by name)
+# ---------------------------------------------------------------------------
+
+VIEW_PROPERTY_SUMMARY    = "view_property_summary"
+VIEW_PORTFOLIO_CF_INPUTS = "view_portfolio_cash_flow_inputs"
+
+
+# ---------------------------------------------------------------------------
+# View DDL
+# ---------------------------------------------------------------------------
+
+# view_property_summary
+# ----------------------
+# One row per property.  Pre-aggregates active-lease metrics so the analytics
+# layer can fetch a single row rather than summing individual lease records.
+# "Active" is evaluated against DATE('now') at query time, so the view always
+# reflects the current state of the rent roll.
+#
+# Columns
+#   active_tenant_count       — leases whose term covers today
+#   delinquent_tenant_count   — active leases flagged is_delinquent = 1
+#   occupied_sqft             — total SF under active leases
+#   delinquent_sqft           — SF held by delinquent tenants
+#   gross_scheduled_rent      — annualised contracted rent from active leases
+#   delinquent_rent           — gross_scheduled_rent share from delinquent tenants
+#   weighted_delinquency_rate — delinquent_rent / gross_scheduled_rent
+#   total_operating_expenses  — most recent full-year expense total (0 if none recorded)
+
+_SQL_VIEW_PROPERTY_SUMMARY = """
+CREATE VIEW IF NOT EXISTS view_property_summary AS
+SELECT
+    p.property_id,
+    p.property_name,
+    p.asset_class,
+    p.total_sqft,
+    p.acquisition_price,
+    p.target_exit_cap_rate,
+    COUNT(CASE
+        WHEN l.lease_start <= DATE('now')
+         AND l.lease_end   >= DATE('now')
+        THEN 1 END)                                          AS active_tenant_count,
+    COUNT(CASE
+        WHEN l.lease_start <= DATE('now')
+         AND l.lease_end   >= DATE('now')
+         AND l.is_delinquent = 1
+        THEN 1 END)                                          AS delinquent_tenant_count,
+    COALESCE(SUM(CASE
+        WHEN l.lease_start <= DATE('now')
+         AND l.lease_end   >= DATE('now')
+        THEN l.square_footage END), 0)                       AS occupied_sqft,
+    COALESCE(SUM(CASE
+        WHEN l.lease_start <= DATE('now')
+         AND l.lease_end   >= DATE('now')
+         AND l.is_delinquent = 1
+        THEN l.square_footage END), 0)                       AS delinquent_sqft,
+    COALESCE(SUM(CASE
+        WHEN l.lease_start <= DATE('now')
+         AND l.lease_end   >= DATE('now')
+        THEN l.base_rent_psf * l.square_footage END), 0.0)   AS gross_scheduled_rent,
+    COALESCE(SUM(CASE
+        WHEN l.lease_start <= DATE('now')
+         AND l.lease_end   >= DATE('now')
+         AND l.is_delinquent = 1
+        THEN l.base_rent_psf * l.square_footage END), 0.0)   AS delinquent_rent,
+    CASE
+        WHEN COALESCE(SUM(CASE
+                 WHEN l.lease_start <= DATE('now')
+                  AND l.lease_end   >= DATE('now')
+                 THEN l.base_rent_psf * l.square_footage END), 0.0) > 0
+        THEN COALESCE(SUM(CASE
+                 WHEN l.lease_start <= DATE('now')
+                  AND l.lease_end   >= DATE('now')
+                  AND l.is_delinquent = 1
+                 THEN l.base_rent_psf * l.square_footage END), 0.0)
+             / SUM(CASE
+                 WHEN l.lease_start <= DATE('now')
+                  AND l.lease_end   >= DATE('now')
+                 THEN l.base_rent_psf * l.square_footage END)
+        ELSE 0.0
+    END                                                       AS weighted_delinquency_rate,
+    COALESCE((
+        SELECT SUM(e.amount)
+        FROM   expenses e
+        WHERE  e.property_id  = p.property_id
+          AND  e.expense_year = (
+               SELECT MAX(e2.expense_year)
+               FROM   expenses e2
+               WHERE  e2.property_id = p.property_id
+          )
+    ), 0.0)                                                   AS total_operating_expenses
+FROM  properties p
+LEFT  JOIN leases l ON l.property_id = p.property_id
+GROUP BY
+    p.property_id,
+    p.property_name,
+    p.asset_class,
+    p.total_sqft,
+    p.acquisition_price,
+    p.target_exit_cap_rate
+"""
+
+
+# view_portfolio_cash_flow_inputs
+# --------------------------------
+# One row per asset class.  Groups active, non-delinquent income streams and
+# baseline expense records across the entire portfolio, establishing a clean
+# operational baseline for multi-property rollups.
+#
+# Columns
+#   property_count              — distinct properties in this asset class
+#   total_portfolio_sqft        — sum of total_sqft from the properties table
+#   active_clean_rent           — scheduled rent from active, non-delinquent leases
+#   total_scheduled_rent        — scheduled rent from ALL active leases
+#   active_clean_tenant_count   — count of active non-delinquent tenants
+#   total_active_tenant_count   — count of all active tenants
+#   baseline_operating_expenses — most recent full-year OpEx summed across class
+#   portfolio_delinquency_rate  — delinquent_rent / total_scheduled_rent (class-level)
+
+_SQL_VIEW_PORTFOLIO_CF_INPUTS = """
+CREATE VIEW IF NOT EXISTS view_portfolio_cash_flow_inputs AS
+SELECT
+    p.asset_class,
+    COUNT(DISTINCT p.property_id)                            AS property_count,
+    COALESCE((
+        SELECT SUM(p2.total_sqft)
+        FROM   properties p2
+        WHERE  p2.asset_class = p.asset_class
+    ), 0)                                                    AS total_portfolio_sqft,
+    COALESCE(SUM(CASE
+        WHEN l.lease_start <= DATE('now')
+         AND l.lease_end   >= DATE('now')
+         AND l.is_delinquent = 0
+        THEN l.base_rent_psf * l.square_footage END), 0.0)   AS active_clean_rent,
+    COALESCE(SUM(CASE
+        WHEN l.lease_start <= DATE('now')
+         AND l.lease_end   >= DATE('now')
+        THEN l.base_rent_psf * l.square_footage END), 0.0)   AS total_scheduled_rent,
+    COUNT(CASE
+        WHEN l.lease_start <= DATE('now')
+         AND l.lease_end   >= DATE('now')
+         AND l.is_delinquent = 0
+        THEN 1 END)                                          AS active_clean_tenant_count,
+    COUNT(CASE
+        WHEN l.lease_start <= DATE('now')
+         AND l.lease_end   >= DATE('now')
+        THEN 1 END)                                          AS total_active_tenant_count,
+    COALESCE((
+        SELECT SUM(sub.prop_expense)
+        FROM (
+            SELECT e.property_id,
+                   SUM(e.amount) AS prop_expense
+            FROM   expenses e
+            WHERE  e.expense_year = (
+                   SELECT MAX(e2.expense_year)
+                   FROM   expenses e2
+                   WHERE  e2.property_id = e.property_id
+            )
+            GROUP BY e.property_id
+        ) sub
+        JOIN   properties p2 ON p2.property_id = sub.property_id
+                             AND p2.asset_class = p.asset_class
+    ), 0.0)                                                  AS baseline_operating_expenses,
+    CASE
+        WHEN COALESCE(SUM(CASE
+                 WHEN l.lease_start <= DATE('now')
+                  AND l.lease_end   >= DATE('now')
+                 THEN l.base_rent_psf * l.square_footage END), 0.0) > 0
+        THEN COALESCE(SUM(CASE
+                 WHEN l.lease_start <= DATE('now')
+                  AND l.lease_end   >= DATE('now')
+                  AND l.is_delinquent = 1
+                 THEN l.base_rent_psf * l.square_footage END), 0.0)
+             / SUM(CASE
+                 WHEN l.lease_start <= DATE('now')
+                  AND l.lease_end   >= DATE('now')
+                 THEN l.base_rent_psf * l.square_footage END)
+        ELSE 0.0
+    END                                                      AS portfolio_delinquency_rate
+FROM  properties p
+LEFT  JOIN leases l ON l.property_id = p.property_id
+GROUP BY p.asset_class
+"""
+
+
+def _create_views(engine: Engine) -> None:
+    """
+    Create both analytical views inside the database.
+
+    Uses CREATE VIEW IF NOT EXISTS so repeated calls (e.g. every pipeline run)
+    are idempotent — existing views are left untouched.
+    """
+    with engine.begin() as conn:
+        conn.execute(text(_SQL_VIEW_PROPERTY_SUMMARY))
+        conn.execute(text(_SQL_VIEW_PORTFOLIO_CF_INPUTS))
+
+
+# ---------------------------------------------------------------------------
 # Engine / session factory
 # ---------------------------------------------------------------------------
 
@@ -198,9 +395,10 @@ def get_session_factory(engine: Engine):
 
 
 def init_db(db_path: Path = _DB_PATH) -> Engine:
-    """Create all tables (no-op if they already exist) and return the engine."""
+    """Create all tables and analytical views (no-op if they already exist)."""
     engine = get_engine(db_path)
     Base.metadata.create_all(engine)
+    _create_views(engine)
     return engine
 
 

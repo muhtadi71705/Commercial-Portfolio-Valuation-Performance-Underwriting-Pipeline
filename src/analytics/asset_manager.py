@@ -4,7 +4,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from src.core.underwriting import Asset, ProFormaYear
@@ -12,6 +12,8 @@ from src.database.db_manager import (
     Expense,
     Lease,
     Property,
+    VIEW_PORTFOLIO_CF_INPUTS,
+    VIEW_PROPERTY_SUMMARY,
     _DB_PATH,
     get_engine,
     get_session_factory,
@@ -159,6 +161,48 @@ class AssetManager:
 
         return annual_total + annualized_monthly
 
+    def _fetch_property_summary(self, property_id: str) -> dict[str, Any] | None:
+        """
+        Fetch one row from view_property_summary for *property_id*.
+
+        The view pre-aggregates active-lease counts, occupied SF, gross scheduled
+        rent, delinquent rent, weighted delinquency rate, and the most recent
+        full-year operating expense total — all evaluated against DATE('now').
+
+        Returns None when the property has no database row.
+        """
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text(f"SELECT * FROM {VIEW_PROPERTY_SUMMARY} WHERE property_id = :pid"),
+                {"pid": property_id},
+            ).mappings().fetchone()
+        return dict(row) if row else None
+
+    def _fetch_portfolio_cf_inputs(
+        self, asset_class: str | None = None
+    ) -> list[dict[str, Any]]:
+        """
+        Fetch rows from view_portfolio_cash_flow_inputs.
+
+        Returns all asset classes when *asset_class* is None, or a single-element
+        list when filtered.  Each row contains clean-income totals, tenant counts,
+        baseline expenses, and a portfolio-level delinquency rate grouped by class.
+        """
+        with self._engine.connect() as conn:
+            if asset_class:
+                rows = conn.execute(
+                    text(
+                        f"SELECT * FROM {VIEW_PORTFOLIO_CF_INPUTS}"
+                        " WHERE asset_class = :ac"
+                    ),
+                    {"ac": asset_class},
+                ).mappings().fetchall()
+            else:
+                rows = conn.execute(
+                    text(f"SELECT * FROM {VIEW_PORTFOLIO_CF_INPUTS}")
+                ).mappings().fetchall()
+        return [dict(r) for r in rows]
+
     # ------------------------------------------------------------------
     # Cash flow computation
     # ------------------------------------------------------------------
@@ -167,58 +211,73 @@ class AssetManager:
         self, property_id: str, asset: Asset, as_of: date
     ) -> dict[str, Any]:
         """
-        Derive actual annual cash flows from live lease and expense data.
+        Derive actual annual cash flows from view_property_summary.
+
+        Revenue and delinquency metrics come directly from the view aggregate,
+        eliminating per-lease Python summation.  Operating expenses use the
+        most recent full-year total stored in the view (falls back to the
+        annualized expenses query when no database row exists).
 
         Revenue
         -------
-        gross_rent_billed = Σ (base_rent_psf × sqft) for all active leases
-        delinquent_rent   = Σ (base_rent_psf × sqft) for delinquent active leases
-        collected_revenue = gross_rent_billed − delinquent_rent
+        gross_scheduled_rent  — contracted rent from active leases (view)
+        delinquent_rent       — share withheld by delinquent tenants (view)
+        collected_revenue     = gross_scheduled_rent − delinquent_rent
 
         Expenses
         --------
-        operating_expenses = annualized from the expenses table for as_of.year
+        total_operating_expenses — most recent complete year total from view
 
         NOI / LNCF
         ----------
-        net_operating_income   = collected_revenue − operating_expenses
-        debt_service           = asset._annual_debt_service  (deterministic)
-        levered_net_cash_flow  = net_operating_income − debt_service
+        net_operating_income  = collected_revenue − operating_expenses
+        debt_service          = asset._annual_debt_service  (deterministic)
+        levered_net_cash_flow = net_operating_income − debt_service
         """
-        leases = self._fetch_active_leases(property_id, as_of)
-        opex   = self._fetch_annualized_expenses(property_id, as_of.year, as_of.month)
+        summary = self._fetch_property_summary(property_id)
 
-        gross_rent    = sum(l.base_rent_psf * l.square_footage for l in leases)
-        delinq_rent   = sum(l.base_rent_psf * l.square_footage for l in leases if l.is_delinquent)
-        collected_rev = gross_rent - delinq_rent
-        noi           = collected_rev - opex
-        ds            = asset._annual_debt_service
-        lncf          = noi - ds
+        if summary is not None:
+            gross_rent    = float(summary["gross_scheduled_rent"])
+            delinq_rent   = float(summary["delinquent_rent"])
+            opex          = float(summary["total_operating_expenses"])
+            occupied_sqft = int(summary["occupied_sqft"])
+            delinq_sqft   = int(summary["delinquent_sqft"])
+            tenant_count  = int(summary["active_tenant_count"])
+            delinq_count  = int(summary["delinquent_tenant_count"])
+        else:
+            # Property absent from DB — derive from asset model and raw expense query
+            gross_rent    = asset.base_rent_psf * asset.total_sqft
+            delinq_rent   = 0.0
+            opex          = self._fetch_annualized_expenses(property_id, as_of.year, as_of.month)
+            occupied_sqft = asset.total_sqft
+            delinq_sqft   = 0
+            tenant_count  = len(asset.lease_schedule)
+            delinq_count  = 0
 
-        occupied_sqft  = sum(l.square_footage for l in leases)
-        delinq_sqft    = sum(l.square_footage for l in leases if l.is_delinquent)
-        delinq_count   = sum(1 for l in leases if l.is_delinquent)
+        collected_rev  = gross_rent - delinq_rent
+        noi            = collected_rev - opex
+        ds             = asset._annual_debt_service
+        lncf           = noi - ds
         delinq_rate    = (delinq_rent / gross_rent) if gross_rent > 0 else 0.0
         occupancy_rate = (occupied_sqft / asset.total_sqft) if asset.total_sqft > 0 else 0.0
         dscr           = (noi / ds) if ds > 0 else float("inf")
 
         return {
-            "gross_rent_billed":    round(gross_rent,    2),
-            "delinquent_rent":      round(delinq_rent,   2),
-            "collected_revenue":    round(collected_rev, 2),
-            "operating_expenses":   round(opex,          2),
-            "net_operating_income": round(noi,           2),
-            "debt_service":         round(ds,            2),
-            "levered_net_cash_flow":round(lncf,          2),
-            # performance stats
-            "dscr":                 round(dscr,          4),
-            "delinquency_rate":     round(delinq_rate,   4),
-            "occupancy_rate":       round(occupancy_rate,4),
-            "total_sqft":           asset.total_sqft,
-            "occupied_sqft":        occupied_sqft,
-            "delinquent_sqft":      delinq_sqft,
-            "total_tenant_count":   len(leases),
-            "delinquent_tenant_count": delinq_count,
+            "gross_rent_billed":        round(gross_rent,    2),
+            "delinquent_rent":          round(delinq_rent,   2),
+            "collected_revenue":        round(collected_rev, 2),
+            "operating_expenses":       round(opex,          2),
+            "net_operating_income":     round(noi,           2),
+            "debt_service":             round(ds,            2),
+            "levered_net_cash_flow":    round(lncf,          2),
+            "dscr":                     round(dscr,          4),
+            "delinquency_rate":         round(delinq_rate,   4),
+            "occupancy_rate":           round(occupancy_rate,4),
+            "total_sqft":               asset.total_sqft,
+            "occupied_sqft":            occupied_sqft,
+            "delinquent_sqft":          delinq_sqft,
+            "total_tenant_count":       tenant_count,
+            "delinquent_tenant_count":  delinq_count,
         }
 
     def _compute_budget_cashflows(self, asset: Asset) -> dict[str, Any]:
@@ -548,6 +607,31 @@ class AssetManager:
             }
 
         return report
+
+    def generate_portfolio_cf_baseline(
+        self,
+        asset_class: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Return pre-aggregated cash flow input baselines from the database view.
+
+        Reads view_portfolio_cash_flow_inputs, which groups all active,
+        non-delinquent income streams and the most recent full-year baseline
+        expense records across the entire portfolio by asset class.
+
+        Parameters
+        ----------
+        asset_class : optional filter; if None all asset classes are returned.
+
+        Returns
+        -------
+        list of dicts (one per asset class) with keys:
+            asset_class, property_count, total_portfolio_sqft,
+            active_clean_rent, total_scheduled_rent,
+            active_clean_tenant_count, total_active_tenant_count,
+            baseline_operating_expenses, portfolio_delinquency_rate
+        """
+        return self._fetch_portfolio_cf_inputs(asset_class)
 
     def generate_portfolio_report(
         self,
