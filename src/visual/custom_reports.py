@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from fpdf import FPDF
 
+from src.analytics.simulator import SensitivityMatrix
 from src.core.underwriting import Asset, DCFResult, ProFormaYear
 from src.core.waterfall import WaterfallResult
 
@@ -209,17 +210,20 @@ class ICMemorandum:
         dcf:           DCFResult,
         report:        dict[str, Any],
         waterfall:     WaterfallResult | None = None,
+        sensitivity:   SensitivityMatrix | None = None,
         property_name: str | None = None,
         prepared_by:   str = "CRE-Val Platform",
     ) -> None:
-        self._asset    = asset
-        self._pf       = pro_forma
-        self._dcf      = dcf
-        self._report   = report
-        self._wf       = waterfall
-        self._name     = property_name or report.get("property_name") or asset.property_id
-        self._by       = prepared_by
-        self._ac       = (report.get("asset_class") or "commercial").title()
+        self._asset        = asset
+        self._pf           = pro_forma
+        self._dcf          = dcf
+        self._report       = report
+        self._wf           = waterfall
+        self._sm           = sensitivity
+        self._total_pages  = 4 if sensitivity is not None else 3
+        self._name         = property_name or report.get("property_name") or asset.property_id
+        self._by           = prepared_by
+        self._ac           = (report.get("asset_class") or "commercial").title()
 
         pdf = FPDF(orientation="P", unit="mm", format="Letter")
         pdf.set_margins(MARGIN, MARGIN, MARGIN)
@@ -231,10 +235,12 @@ class ICMemorandum:
     # ------------------------------------------------------------------
 
     def build(self, output_path: str | Path) -> Path:
-        """Render all three pages and write the PDF to *output_path*."""
+        """Render all pages and write the PDF to *output_path*."""
         self._page_cover()
         self._page_pro_forma()
         self._page_dcf_recommendation()
+        if self._sm is not None:
+            self._page_sensitivity_matrix()
         out = Path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
         self._pdf.output(str(out))
@@ -714,13 +720,154 @@ class ICMemorandum:
 
     def _footer(self, page_num: int) -> None:
         pdf = self._pdf
+        # Disable auto_page_break so the footer always lands on the current page,
+        # not on a new one triggered by set_y being past the break threshold.
+        pdf.set_auto_page_break(auto=False)
         pdf.set_y(PAGE_H - 10)
         pdf.set_font("Helvetica", "I", 6.5)
         pdf.set_text_color(*MUTED)
         pdf.cell(BODY_W * 0.6, 5,
                  "CONFIDENTIAL  -  This document contains proprietary financial projections.",
                  align="L")
-        pdf.cell(BODY_W * 0.4, 5, f"Page {page_num} of 3", align="R")
+        pdf.cell(BODY_W * 0.4, 5, f"Page {page_num} of {self._total_pages}", align="R")
+        pdf.set_auto_page_break(auto=True, margin=14)
+
+    # ------------------------------------------------------------------
+    # Page 4 — Macro Sensitivity Analysis
+    # ------------------------------------------------------------------
+
+    def _page_sensitivity_matrix(self) -> None:
+        pdf = self._pdf
+        pdf.add_page()
+        self._section_header("MACRO SENSITIVITY ANALYSIS")
+
+        sm        = self._sm
+        cap_rates = sm.cap_rate_range
+        vacancies = sm.vacancy_range
+        n_cols    = len(cap_rates)
+
+        # Subtitle
+        pdf.set_xy(MARGIN, pdf.get_y() + 2)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(*MUTED)
+        subtitle = (
+            f"Parametric stress test: {len(vacancies)} vacancy levels x "
+            f"{n_cols} exit cap rate scenarios  -  Combined IRR with LP / GP split"
+        )
+        pdf.cell(BODY_W, 5, _s(subtitle), align="L")
+        pdf.ln(9)
+
+        # Table layout
+        label_w = 32.0
+        col_w   = (BODY_W - label_w) / n_cols
+        hdr_h   = 7.5
+        row_h   = 15.0
+
+        # Header row
+        y = pdf.get_y()
+        pdf.set_fill_color(*NAVY)
+        pdf.set_text_color(*WHITE)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_xy(MARGIN, y)
+        pdf.cell(label_w, hdr_h, "VACANCY  \\  EXIT CAP", fill=True, border=0, align="C")
+        for c in cap_rates:
+            pdf.cell(col_w, hdr_h, f"{c:.2%}  Exit Cap", fill=True, border=0, align="C")
+        pdf.ln()
+
+        # Data rows
+        for i, v in enumerate(vacancies):
+            y    = pdf.get_y()
+            fill = (i % 2 == 0)
+            pdf.set_fill_color(*(LIGHT if fill else WHITE))
+            pdf.rect(MARGIN, y, BODY_W, row_h, style="F")
+
+            # Vacancy label — centred vertically in the row
+            pdf.set_xy(MARGIN, y + (row_h - 5) / 2)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(*NAVY)
+            pdf.cell(label_w, 5, f"{v:.1%}", align="C")
+
+            # Data cells: Combined IRR (large, colored) then LP/GP split below
+            for j, c in enumerate(cap_rates):
+                cell = sm.get(v, c)
+                cx   = MARGIN + label_w + j * col_w
+
+                if cell is None:
+                    pdf.set_xy(cx, y + (row_h - 5) / 2)
+                    pdf.set_font("Helvetica", "", 8)
+                    pdf.set_text_color(*MUTED)
+                    pdf.cell(col_w, 5, "N/A", align="C")
+                    continue
+
+                irr       = cell.combined_irr
+                irr_color = GREEN if irr >= 0.12 else (AMBER if irr >= 0.08 else RED)
+
+                # Line 1: Combined IRR
+                pdf.set_xy(cx, y + 2.5)
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.set_text_color(*irr_color)
+                pdf.cell(col_w, 5, f"{irr:.2%}", align="C")
+
+                # Line 2: LP / GP split
+                pdf.set_xy(cx, y + 8.5)
+                pdf.set_font("Helvetica", "", 7)
+                pdf.set_text_color(*MUTED)
+                pdf.cell(col_w, 4,
+                         f"LP {cell.lp_irr:.1%}  /  GP {cell.gp_irr:.1%}",
+                         align="C")
+
+            pdf.set_xy(MARGIN, y + row_h)
+
+        # Divider
+        div_y = pdf.get_y() + 3
+        self._hline(div_y)
+
+        # Legend strip
+        leg_y   = div_y + 4
+        leg_col = BODY_W / 3
+        pdf.set_fill_color(*LIGHT)
+        pdf.rect(MARGIN, leg_y, BODY_W, 8, style="F")
+
+        legend_items = [
+            ("Combined IRR >= 12%  (Outperforms Hurdle)", GREEN),
+            ("Combined IRR  8-12%  (Threshold Zone)",     AMBER),
+            ("Combined IRR  < 8%   (Below Hurdle)",       RED),
+        ]
+        for k, (label, color) in enumerate(legend_items):
+            bx = MARGIN + k * leg_col
+            pdf.set_fill_color(*color)
+            pdf.rect(bx + 3, leg_y + 2.5, 4, 3.5, style="F")
+            pdf.set_xy(bx + 9, leg_y + 1.5)
+            pdf.set_font("Helvetica", "", 7)
+            pdf.set_text_color(*MUTED)
+            pdf.cell(leg_col - 9, 5, _s(label))
+
+        # Base-case callout (rendered only if base case falls within the grid)
+        base_v    = self._asset.vacancy_rate
+        base_c    = self._asset.exit_cap_rate
+        base_cell = sm.get(base_v, base_c)
+
+        if base_cell:
+            call_y = leg_y + 12
+            pdf.set_fill_color(*LIGHT)
+            pdf.rect(MARGIN, call_y, BODY_W, 9, style="F")
+            pdf.set_xy(MARGIN + 4, call_y + 2)
+            pdf.set_font("Helvetica", "B", 8)
+            pdf.set_text_color(*NAVY)
+            pdf.cell(22, 5, "Base Case:")
+            pdf.set_font("Helvetica", "", 8)
+            pdf.set_text_color(*BLACK)
+            pdf.cell(
+                BODY_W - 26, 5,
+                _s(
+                    f"Vacancy {base_v:.1%}  |  Exit Cap {base_c:.2%}  ->  "
+                    f"Combined IRR {base_cell.combined_irr:.2%}  "
+                    f"|  LP IRR {base_cell.lp_irr:.2%}  "
+                    f"|  GP IRR {base_cell.gp_irr:.2%}"
+                ),
+            )
+
+        self._footer(4)
 
     # ------------------------------------------------------------------
     # Recommendation logic

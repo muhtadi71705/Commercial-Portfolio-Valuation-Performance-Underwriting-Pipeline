@@ -43,6 +43,7 @@ import copy
 import pandas as pd
 
 from src.analytics.asset_manager import AssetManager
+from src.analytics.simulator import SensitivityMatrix, run_macro_sensitivity_matrix
 from src.config.loader import BatchResult, load_mapping_config, validate_batch
 from src.config.schemas import LeaseRecord
 from src.core.underwriting import CommercialAsset, MultifamilyAsset, Asset, LeaseInfo
@@ -313,6 +314,54 @@ def _print_header() -> None:
     print("  " + "─" * 60)
 
 
+def _print_sensitivity_table(pid: str, matrix: SensitivityMatrix) -> None:
+    """Print a formatted sensitivity grid to stdout."""
+    cap_rates = matrix.cap_rate_range
+    vacancies = matrix.vacancy_range
+    n_cols    = len(cap_rates)
+
+    VAC_W  = 10
+    COL_W  = 24
+    SEP    = "  "
+    INDENT = "  "
+    total_w = VAC_W + len(SEP) + n_cols * (COL_W + len(SEP))
+    rule    = INDENT + "─" * total_w
+
+    print()
+    print(f"{INDENT}MACRO SENSITIVITY ANALYSIS  —  {pid}")
+    vac_str = "  ".join(f"{v:.1%}" for v in vacancies)
+    cap_str = "  ".join(f"{c:.2%}" for c in cap_rates)
+    print(f"{INDENT}Vacancy ({vac_str})  x  Exit Cap ({cap_str})")
+    print(f"{INDENT}Combined IRR  ·  ( LP IRR  /  GP IRR )")
+    print()
+
+    # Column header row
+    hdr = f"{INDENT}{'Vacancy':>{VAC_W}}{SEP}"
+    for c in cap_rates:
+        hdr += f"{f'{c:.2%} Exit':^{COL_W}}{SEP}"
+    print(hdr)
+    print(rule)
+
+    for v in vacancies:
+        row1 = f"{INDENT}{f'{v:.1%}':>{VAC_W}}{SEP}"
+        row2 = f"{INDENT}{' ' * VAC_W}{SEP}"
+        for c in cap_rates:
+            cell = matrix.get(v, c)
+            if cell:
+                combo  = f"{cell.combined_irr:.2%}"
+                detail = f"LP {cell.lp_irr:.1%}  /  GP {cell.gp_irr:.1%}"
+            else:
+                combo  = "N/A"
+                detail = ""
+            row1 += f"{combo:^{COL_W}}{SEP}"
+            row2 += f"{detail:^{COL_W}}{SEP}"
+        print(row1)
+        print(row2)
+
+    print(rule)
+    print()
+
+
 def _print_summary_table(results: list[dict]) -> None:
     print()
     w_id, w_name, w_irr, w_dscr, w_st = 14, 24, 10, 8, 10
@@ -515,10 +564,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     for pid, asset in assets.items():
         try:
-            pf        = asset.generate_10_year_pro_forma()
-            dcf       = asset.calculate_dcf(pf)
-            report    = manager.generate_property_report(pid, as_of=date.today())
-            waterfall = run_waterfall(list(dcf.equity_cash_flows))
+            pf          = asset.generate_10_year_pro_forma()
+            dcf         = asset.calculate_dcf(pf)
+            report      = manager.generate_property_report(pid, as_of=date.today())
+            waterfall   = run_waterfall(list(dcf.equity_cash_flows))
+            sensitivity = run_macro_sensitivity_matrix(asset)
 
             pdf_path = output_dir / f"{pid}_ICM_{date.today().strftime('%Y%m%d')}.pdf"
             memo = ICMemorandum(
@@ -527,6 +577,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 dcf           = dcf,
                 report        = report,
                 waterfall     = waterfall,
+                sensitivity   = sensitivity,
                 prepared_by   = "CRE-Val Platform",
             )
             memo.build(pdf_path)
@@ -556,7 +607,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     sev = a["severity"]
                     print(f"      [{sev}] {a['message'][:80]}")
             print(f"      PDF → {pdf_path}")
-            print()
+            _print_sensitivity_table(pid, sensitivity)
 
         except Exception as exc:
             print(f"  ERROR processing {pid}: {exc}")
