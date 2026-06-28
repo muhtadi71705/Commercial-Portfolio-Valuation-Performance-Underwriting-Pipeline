@@ -1,10 +1,11 @@
 """
 Investment Committee Memorandum (ICM) — PDF report generator.
 
-Produces a clean 3-page typeset PDF using fpdf2 + matplotlib:
+Produces an institutional-grade PDF using ReportLab Platypus:
   Page 1  Cover & Executive Summary (key metrics, alert banner)
   Page 2  10-Year Pro Forma table + NOI/DS bar chart + cumulative-CF line chart
-  Page 3  DCF Summary, Lease Roll table, and HOLD / MONITOR / SELL recommendation
+  Page 3  DCF Summary, Equity Waterfall, Lease Roll, HOLD / MONITOR / SELL recommendation
+  Page 4  Macro Sensitivity Analysis (optional)
 
 Usage
 -----
@@ -23,42 +24,110 @@ from typing import Any
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-from fpdf import FPDF
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.pagesizes import LETTER
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    BaseDocTemplate,
+    Frame,
+    HRFlowable,
+    Image,
+    KeepTogether,
+    NextPageTemplate,
+    PageBreak,
+    PageTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 from src.analytics.simulator import SensitivityMatrix
 from src.core.underwriting import Asset, DCFResult, ProFormaYear
 from src.core.waterfall import WaterfallResult
 
-matplotlib.use("Agg")   # headless; no display needed
+matplotlib.use("Agg")
 
 
 # ---------------------------------------------------------------------------
-# Brand palette  (R, G, B)
+# Brand palette
 # ---------------------------------------------------------------------------
 
-NAVY  = (27,  58,  107)
-GOLD  = (184, 147,  68)
-LIGHT = (240, 243, 248)
-WHITE = (255, 255, 255)
-BLACK = (25,  25,  25)
-MUTED = (110, 120, 135)
-GREEN = (21,  128,  61)
-AMBER = (180,  83,   9)
-RED   = (185,  28,  28)
+NAVY  = colors.Color(27 / 255,  58 / 255,  107 / 255)
+GOLD  = colors.Color(184 / 255, 147 / 255,  68 / 255)
+LIGHT = colors.Color(240 / 255, 243 / 255, 248 / 255)
+WHITE = colors.white
+BLACK = colors.Color(25 / 255,  25 / 255,   25 / 255)
+MUTED = colors.Color(110 / 255, 120 / 255, 135 / 255)
+SLATE = colors.Color(100 / 255, 116 / 255, 139 / 255)
+GREEN = colors.Color(21 / 255,  128 / 255,  61 / 255)
+AMBER = colors.Color(180 / 255,  83 / 255,   9 / 255)
+RED   = colors.Color(185 / 255,  28 / 255,  28 / 255)
 
-PAGE_W  = 215.9   # Letter width  mm
-PAGE_H  = 279.4   # Letter height mm
-MARGIN  = 14.0
-BODY_W  = PAGE_W - 2 * MARGIN   # 187.9 mm usable width
+# Raw RGB tuples used only in matplotlib
+_NAVY_RGB  = (27 / 255,  58 / 255,  107 / 255)
+_GOLD_RGB  = (184 / 255, 147 / 255,  68 / 255)
+_GREEN_RGB = (21 / 255,  128 / 255,  61 / 255)
+_RED_RGB   = (185 / 255,  28 / 255,  28 / 255)
+_LIGHT_HEX = "#F0F3F8"
+
+
+# ---------------------------------------------------------------------------
+# Page geometry (Letter: 612 × 792 pt)
+# ---------------------------------------------------------------------------
+
+PAGE_W, PAGE_H = LETTER        # 612, 792
+MARGIN         = 14 * mm       # 39.69 pt
+BODY_W         = PAGE_W - 2 * MARGIN
+
+COVER_HDR_H   = 38 * mm        # navy masthead height on cover
+SECTION_HDR_H = 18 * mm        # section bar height on body pages
+FOOTER_ZONE   = 14 * mm        # bottom reserved for footer
+
+
+# ---------------------------------------------------------------------------
+# Paragraph styles
+# ---------------------------------------------------------------------------
+
+def _ps(name: str, **kw) -> ParagraphStyle:
+    base = dict(
+        fontName="Helvetica", fontSize=9, textColor=BLACK,
+        leading=13, leftIndent=0, rightIndent=0,
+        spaceAfter=0, spaceBefore=0,
+    )
+    base.update(kw)
+    return ParagraphStyle(name, **base)
+
+
+P_PROP_NAME  = _ps("prop_name",  fontName="Helvetica-Bold", fontSize=20,
+                    textColor=NAVY, leading=26, spaceAfter=2 * mm)
+P_SUBTITLE   = _ps("subtitle",   fontSize=9, textColor=MUTED, leading=12,
+                    spaceAfter=2 * mm)
+P_SECTION    = _ps("section",    fontName="Helvetica-Bold", fontSize=9,
+                    textColor=NAVY, leading=12,
+                    spaceBefore=4 * mm, spaceAfter=2 * mm)
+P_BODY       = _ps("body",       fontSize=8, leading=11)
+P_SMALL      = _ps("small",      fontSize=7.5, textColor=MUTED, leading=10)
+P_ALERT_HDR  = _ps("alert_hdr",  fontName="Helvetica-Bold", fontSize=8,
+                    textColor=NAVY, leading=12,
+                    spaceBefore=3 * mm, spaceAfter=1 * mm)
+P_BANNER_TXT = _ps("banner_txt", fontName="Helvetica-Bold", fontSize=9,
+                    textColor=WHITE, leading=12, alignment=TA_CENTER)
+P_REC_LABEL  = _ps("rec_label",  fontSize=8, textColor=WHITE,
+                    leading=11, alignment=TA_CENTER)
+P_REC_MAIN   = _ps("rec_main",   fontName="Helvetica-Bold", fontSize=20,
+                    textColor=WHITE, leading=26, alignment=TA_CENTER)
+P_REC_NOTE   = _ps("rec_note",   fontName="Helvetica-Oblique", fontSize=7.5,
+                    textColor=WHITE, leading=10, alignment=TA_CENTER)
 
 
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
-
 def _m(v: float, decimals: int = 2) -> str:
-    """Format a dollar value in millions: $3.40M, or $0.27M for small values."""
     if v == 0:
         return "$0"
     sign = "-" if v < 0 else ""
@@ -78,23 +147,16 @@ def _dollar(v: float) -> str:
     return f"{sign}${abs(v):,.0f}"
 
 
-# Helvetica is Latin-1 only; sanitise any string before handing it to fpdf2.
 _UNICODE_MAP = str.maketrans({
-    "–": "-",   # en dash
-    "—": "-",   # em dash
-    "‘": "'",   # left single quote
-    "’": "'",   # right single quote
-    "“": '"',   # left double quote
-    "”": '"',   # right double quote
-    "•": "*",   # bullet
-    "…": "...", # ellipsis
-    "·": ".",   # middle dot
-    "–": "-",
+    "–": "-", "—": "-",
+    "‘": "'", "’": "'",
+    "“": '"', "”": '"',
+    "•": "*", "…": "...", "·": ".",
 })
 
 
 def _s(text: str) -> str:
-    """Return *text* safe for Helvetica (Latin-1) rendering."""
+    """Sanitise to Latin-1 for Helvetica (use in Table cell strings)."""
     return (
         text.translate(_UNICODE_MAP)
             .encode("latin-1", errors="replace")
@@ -102,27 +164,31 @@ def _s(text: str) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Chart builders  (return BytesIO PNG buffers)
-# ---------------------------------------------------------------------------
+def _sp(text: str) -> str:
+    """Sanitise for Platypus Paragraph XML (escapes &, <, >)."""
+    t = _s(text)
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _chart_noi_vs_ds(pro_forma: list[ProFormaYear], w_px: int, h_px: int) -> io.BytesIO:
-    """Grouped bar chart: NOI vs Debt Service across 10 years."""
+# ---------------------------------------------------------------------------
+# Chart builders (unchanged — return BytesIO PNG buffers)
+# ---------------------------------------------------------------------------
+
+def _chart_noi_vs_ds(pro_forma: list[ProFormaYear],
+                     w_px: int, h_px: int) -> io.BytesIO:
     years = [y.year for y in pro_forma]
     noi   = [y.net_operating_income / 1e6 for y in pro_forma]
     ds    = [y.debt_service          / 1e6 for y in pro_forma]
 
     fig, ax = plt.subplots(figsize=(w_px / 100, h_px / 100), dpi=100)
-    fig.patch.set_facecolor("#F0F3F8")
-    ax.set_facecolor("#F0F3F8")
+    fig.patch.set_facecolor(_LIGHT_HEX)
+    ax.set_facecolor(_LIGHT_HEX)
 
-    x     = range(len(years))
-    width = 0.38
-    bars_n = ax.bar([i - width / 2 for i in x], noi, width, label="NOI",
-                    color="#1B3A6B", zorder=3)
-    bars_d = ax.bar([i + width / 2 for i in x], ds, width,  label="Debt Service",
-                    color="#B89344", zorder=3, alpha=0.85)
+    x, width = range(len(years)), 0.38
+    ax.bar([i - width / 2 for i in x], noi, width, label="NOI",
+           color=_NAVY_RGB, zorder=3)
+    ax.bar([i + width / 2 for i in x], ds, width, label="Debt Service",
+           color=_GOLD_RGB, zorder=3, alpha=0.85)
 
     ax.set_xticks(list(x))
     ax.set_xticklabels([f"Y{y}" for y in years], fontsize=7)
@@ -130,7 +196,7 @@ def _chart_noi_vs_ds(pro_forma: list[ProFormaYear], w_px: int, h_px: int) -> io.
     ax.tick_params(axis="y", labelsize=7)
     ax.legend(fontsize=7, framealpha=0)
     ax.set_title("NOI vs. Debt Service", fontsize=9, fontweight="bold",
-                 color="#1B3A6B", pad=6)
+                 color=_NAVY_RGB, pad=6)
     ax.grid(axis="y", color="white", linewidth=0.8, zorder=0)
     ax.spines[["top", "right", "left", "bottom"]].set_visible(False)
     ax.tick_params(axis="both", length=0)
@@ -143,35 +209,34 @@ def _chart_noi_vs_ds(pro_forma: list[ProFormaYear], w_px: int, h_px: int) -> io.
     return buf
 
 
-def _chart_cumulative_cf(pro_forma: list[ProFormaYear], equity: float,
-                          w_px: int, h_px: int) -> io.BytesIO:
-    """Cumulative levered cash flow (equity-in as Year 0 outflow)."""
+def _chart_cumulative_cf(pro_forma: list[ProFormaYear],
+                          equity: float, w_px: int, h_px: int) -> io.BytesIO:
     cfs = [-equity / 1e6] + [y.levered_net_cash_flow / 1e6 for y in pro_forma]
-    cum = []
-    running = 0.0
+    cum, running = [], 0.0
     for c in cfs:
         running += c
         cum.append(running)
     xs = list(range(len(cum)))
 
     fig, ax = plt.subplots(figsize=(w_px / 100, h_px / 100), dpi=100)
-    fig.patch.set_facecolor("#F0F3F8")
-    ax.set_facecolor("#F0F3F8")
+    fig.patch.set_facecolor(_LIGHT_HEX)
+    ax.set_facecolor(_LIGHT_HEX)
 
-    pos = [max(c, 0) for c in cum]
-    neg = [min(c, 0) for c in cum]
-    ax.fill_between(xs, 0, pos, color="#15803D", alpha=0.25, zorder=2)
-    ax.fill_between(xs, neg, 0, color="#B91C1C", alpha=0.25, zorder=2)
-    ax.plot(xs, cum, color="#1B3A6B", linewidth=1.8, zorder=3, marker="o",
-            markersize=3, markerfacecolor="#B89344", markeredgewidth=0)
-    ax.axhline(0, color="#1B3A6B", linewidth=0.7, linestyle="--", alpha=0.6)
+    ax.fill_between(xs, 0, [max(c, 0) for c in cum],
+                    color=_GREEN_RGB, alpha=0.25, zorder=2)
+    ax.fill_between(xs, [min(c, 0) for c in cum], 0,
+                    color=_RED_RGB, alpha=0.25, zorder=2)
+    ax.plot(xs, cum, color=_NAVY_RGB, linewidth=1.8, zorder=3,
+            marker="o", markersize=3,
+            markerfacecolor=_GOLD_RGB, markeredgewidth=0)
+    ax.axhline(0, color=_NAVY_RGB, linewidth=0.7, linestyle="--", alpha=0.6)
 
     ax.set_xticks(xs)
     ax.set_xticklabels([f"Y{i}" for i in xs], fontsize=7)
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:.1f}M"))
     ax.tick_params(labelsize=7)
     ax.set_title("Cumulative Levered Cash Flow", fontsize=9, fontweight="bold",
-                 color="#1B3A6B", pad=6)
+                 color=_NAVY_RGB, pad=6)
     ax.grid(axis="y", color="white", linewidth=0.8, zorder=0)
     ax.spines[["top", "right", "left", "bottom"]].set_visible(False)
     ax.tick_params(axis="both", length=0)
@@ -182,6 +247,150 @@ def _chart_cumulative_cf(pro_forma: list[ProFormaYear], equity: float,
     plt.close(fig)
     buf.seek(0)
     return buf
+
+
+# ---------------------------------------------------------------------------
+# Canvas callbacks — fixed page chrome (headers + footer)
+# ---------------------------------------------------------------------------
+
+def _draw_cover_masthead(canvas, doc, prop_name: str, prepared_by: str) -> None:
+    canvas.saveState()
+    canvas.setFillColor(NAVY)
+    canvas.rect(0, PAGE_H - COVER_HDR_H, PAGE_W, COVER_HDR_H, fill=1, stroke=0)
+
+    canvas.setFillColor(WHITE)
+    canvas.setFont("Helvetica-Bold", 17)
+    canvas.drawString(MARGIN, PAGE_H - 14 * mm,
+                      "INVESTMENT COMMITTEE MEMORANDUM")
+
+    canvas.setFillColor(GOLD)
+    canvas.setFont("Helvetica", 9)
+    canvas.drawString(MARGIN, PAGE_H - 24 * mm,
+                      "STRICTLY CONFIDENTIAL  -  FOR INTERNAL USE ONLY")
+
+    canvas.setFillColor(WHITE)
+    canvas.setFont("Helvetica", 8)
+    canvas.drawRightString(PAGE_W - MARGIN, PAGE_H - 24 * mm,
+                           date.today().strftime("%B %d, %Y"))
+    canvas.restoreState()
+
+
+def _draw_section_header(canvas, doc,
+                          title: str, prop_name: str) -> None:
+    canvas.saveState()
+    canvas.setFillColor(NAVY)
+    canvas.rect(0, PAGE_H - SECTION_HDR_H, PAGE_W, SECTION_HDR_H,
+                fill=1, stroke=0)
+
+    canvas.setFillColor(WHITE)
+    canvas.setFont("Helvetica-Bold", 11)
+    canvas.drawString(MARGIN, PAGE_H - 12 * mm, _s(title))
+
+    canvas.setFillColor(GOLD)
+    canvas.setFont("Helvetica", 8)
+    canvas.drawRightString(PAGE_W - MARGIN, PAGE_H - 12 * mm, _s(prop_name))
+    canvas.restoreState()
+
+
+def _draw_footer(canvas, doc, page_num: int, total_pages: int) -> None:
+    canvas.saveState()
+    canvas.setFont("Helvetica-Oblique", 6.5)
+    canvas.setFillColor(MUTED)
+    canvas.drawString(
+        MARGIN, 8 * mm,
+        "CONFIDENTIAL  -  This document contains proprietary financial projections.",
+    )
+    canvas.drawRightString(
+        PAGE_W - MARGIN, 8 * mm,
+        f"Page {page_num} of {total_pages}",
+    )
+    canvas.restoreState()
+
+
+# ---------------------------------------------------------------------------
+# Reusable table builders
+# ---------------------------------------------------------------------------
+
+def _two_col_kv_table(rows: list[tuple[str, str, str, str]]) -> Table:
+    """
+    4-column [left_key | left_val | right_key | right_val] table.
+    BOX + INNERGRID + ROWBACKGROUNDS, no header row.
+    """
+    lbl_w = BODY_W * 0.27
+    val_w = BODY_W * 0.23
+    data = [[_s(lk), _s(lv), _s(rk), _s(rv)] for lk, lv, rk, rv in rows]
+    t = Table(data, colWidths=[lbl_w, val_w, lbl_w, val_w])
+    t.setStyle(TableStyle([
+        ("BOX",       (0, 0), (-1, -1), 0.8, NAVY),
+        ("INNERGRID", (0, 0), (-1, -1), 0.35, SLATE),
+        ("LINEAFTER", (1, 0), (1, -1),  1.2, NAVY),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [LIGHT, WHITE]),
+        ("FONTNAME",  (0, 0), (0, -1), "Helvetica"),
+        ("FONTNAME",  (2, 0), (2, -1), "Helvetica"),
+        ("TEXTCOLOR", (0, 0), (0, -1), MUTED),
+        ("TEXTCOLOR", (2, 0), (2, -1), MUTED),
+        ("FONTNAME",  (1, 0), (1, -1), "Helvetica-Bold"),
+        ("FONTNAME",  (3, 0), (3, -1), "Helvetica-Bold"),
+        ("TEXTCOLOR", (1, 0), (1, -1), NAVY),
+        ("TEXTCOLOR", (3, 0), (3, -1), NAVY),
+        ("ALIGN",     (1, 0), (1, -1), "RIGHT"),
+        ("ALIGN",     (3, 0), (3, -1), "RIGHT"),
+        ("FONTSIZE",  (0, 0), (-1, -1), 8),
+        ("VALIGN",    (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 5),
+    ]))
+    return t
+
+
+def _single_col_kv_table(rows: list[tuple[str, str]],
+                          highlight_rows: set[int] | None = None,
+                          value_colors: dict[int, Any] | None = None) -> Table:
+    """
+    2-column [metric | value] table with header styling.
+    highlight_rows: row indices to bold.
+    value_colors: {row_index: RL_color} overrides.
+    """
+    lbl_w = BODY_W * 0.58
+    val_w = BODY_W - lbl_w
+    data = [[_s(k), _s(v)] for k, v in rows]
+    cmds = [
+        ("BOX",       (0, 0), (-1, -1), 0.8, NAVY),
+        ("INNERGRID", (0, 0), (-1, -1), 0.35, SLATE),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [LIGHT, WHITE]),
+        ("FONTNAME",  (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE",  (0, 0), (-1, -1), 8),
+        ("TEXTCOLOR", (0, 0), (-1, -1), BLACK),
+        ("ALIGN",     (0, 0), (0, -1), "LEFT"),
+        ("ALIGN",     (1, 0), (1, -1), "RIGHT"),
+        ("VALIGN",    (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 5),
+    ]
+    for r in (highlight_rows or set()):
+        cmds.append(("FONTNAME", (0, r), (-1, r), "Helvetica-Bold"))
+    for r, col in (value_colors or {}).items():
+        cmds.append(("TEXTCOLOR", (1, r), (1, r), col))
+    t = Table(data, colWidths=[lbl_w, val_w])
+    t.setStyle(TableStyle(cmds))
+    return t
+
+
+def _financial_header_style(n_header_rows: int = 1) -> list[tuple]:
+    """Standard header-row commands for a financial table."""
+    hr = n_header_rows - 1
+    return [
+        ("BACKGROUND", (0, 0), (-1, hr), NAVY),
+        ("TEXTCOLOR",  (0, 0), (-1, hr), WHITE),
+        ("FONTNAME",   (0, 0), (-1, hr), "Helvetica-Bold"),
+        ("FONTSIZE",   (0, 0), (-1, hr), 7.5),
+        ("ALIGN",      (0, 0), (-1, hr), "CENTER"),
+        ("LINEBELOW",  (0, hr), (-1, hr), 1.5, GOLD),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +400,7 @@ def _chart_cumulative_cf(pro_forma: list[ProFormaYear], equity: float,
 
 class ICMemorandum:
     """
-    Three-page Investment Committee Memorandum PDF.
+    Institutional Investment Committee Memorandum PDF.
 
     Parameters
     ----------
@@ -199,6 +408,8 @@ class ICMemorandum:
     pro_forma     : output of asset.generate_10_year_pro_forma()
     dcf           : output of asset.calculate_dcf(pro_forma)
     report        : output of AssetManager.generate_property_report()
+    waterfall     : output of run_waterfall() (optional)
+    sensitivity   : output of run_macro_sensitivity_matrix() (optional)
     property_name : display name (falls back to report['property_name'])
     prepared_by   : byline text
     """
@@ -214,147 +425,158 @@ class ICMemorandum:
         property_name: str | None = None,
         prepared_by:   str = "CRE-Val Platform",
     ) -> None:
-        self._asset        = asset
-        self._pf           = pro_forma
-        self._dcf          = dcf
-        self._report       = report
-        self._wf           = waterfall
-        self._sm           = sensitivity
-        self._total_pages  = 4 if sensitivity is not None else 3
-        self._name         = property_name or report.get("property_name") or asset.property_id
-        self._by           = prepared_by
-        self._ac           = (report.get("asset_class") or "commercial").title()
-
-        pdf = FPDF(orientation="P", unit="mm", format="Letter")
-        pdf.set_margins(MARGIN, MARGIN, MARGIN)
-        pdf.set_auto_page_break(auto=True, margin=14)
-        self._pdf = pdf
+        self._asset  = asset
+        self._pf     = pro_forma
+        self._dcf    = dcf
+        self._report = report
+        self._wf     = waterfall
+        self._sm     = sensitivity
+        self._name   = property_name or report.get("property_name") or asset.property_id
+        self._by     = prepared_by
+        self._ac     = (report.get("asset_class") or "commercial").title()
+        self._total_pages = 4 if sensitivity is not None else 3
 
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
     def build(self, output_path: str | Path) -> Path:
-        """Render all pages and write the PDF to *output_path*."""
-        self._page_cover()
-        self._page_pro_forma()
-        self._page_dcf_recommendation()
-        if self._sm is not None:
-            self._page_sensitivity_matrix()
         out = Path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        self._pdf.output(str(out))
+
+        doc = BaseDocTemplate(
+            str(out),
+            pagesize=LETTER,
+            leftMargin=0, rightMargin=0,
+            topMargin=0, bottomMargin=0,
+        )
+        doc.addPageTemplates(self._make_page_templates())
+
+        story = [NextPageTemplate("cover")]
+        story += self._cover_story()
+        story += [NextPageTemplate("body_p2"), PageBreak()]
+        story += self._proforma_story()
+        story += [NextPageTemplate("body_p3"), PageBreak()]
+        story += self._dcf_story()
+        if self._sm is not None:
+            story += [NextPageTemplate("body_p4"), PageBreak()]
+            story += self._sensitivity_story()
+
+        doc.build(story)
         return out
+
+    # ------------------------------------------------------------------
+    # Page template factory
+    # ------------------------------------------------------------------
+
+    def _make_page_templates(self) -> list[PageTemplate]:
+        name, by, total = self._name, self._by, self._total_pages
+
+        cover_frame = Frame(
+            MARGIN, FOOTER_ZONE,
+            BODY_W, PAGE_H - COVER_HDR_H - FOOTER_ZONE,
+            leftPadding=0, rightPadding=0,
+            topPadding=3 * mm, bottomPadding=0,
+        )
+        body_frame = Frame(
+            MARGIN, FOOTER_ZONE,
+            BODY_W, PAGE_H - SECTION_HDR_H - FOOTER_ZONE - 2 * mm,
+            leftPadding=0, rightPadding=0,
+            topPadding=3 * mm, bottomPadding=0,
+        )
+
+        def on_cover(canvas, doc):
+            _draw_cover_masthead(canvas, doc, name, by)
+            _draw_footer(canvas, doc, 1, total)
+
+        def on_p2(canvas, doc):
+            _draw_section_header(canvas, doc,
+                                  "10-YEAR PRO FORMA PROJECTION", name)
+            _draw_footer(canvas, doc, 2, total)
+
+        def on_p3(canvas, doc):
+            _draw_section_header(canvas, doc,
+                                  "DISCOUNTED CASH FLOW ANALYSIS & RECOMMENDATION",
+                                  name)
+            _draw_footer(canvas, doc, 3, total)
+
+        def on_p4(canvas, doc):
+            _draw_section_header(canvas, doc,
+                                  "MACRO SENSITIVITY ANALYSIS", name)
+            _draw_footer(canvas, doc, 4, total)
+
+        return [
+            PageTemplate("cover",  [cover_frame], onPage=on_cover),
+            PageTemplate("body_p2", [body_frame],  onPage=on_p2),
+            PageTemplate("body_p3", [body_frame],  onPage=on_p3),
+            PageTemplate("body_p4", [body_frame],  onPage=on_p4),
+        ]
 
     # ------------------------------------------------------------------
     # Page 1 — Cover & Executive Summary
     # ------------------------------------------------------------------
 
-    def _page_cover(self) -> None:
-        pdf = self._pdf
-        pdf.add_page()
+    def _cover_story(self) -> list:
+        asset, dcf, pf = self._asset, self._dcf, self._pf
 
-        # ── navy masthead ──────────────────────────────────────────────
-        pdf.set_fill_color(*NAVY)
-        pdf.rect(0, 0, PAGE_W, 38, style="F")
+        story: list = []
 
-        pdf.set_xy(MARGIN, 9)
-        pdf.set_font("Helvetica", "B", 17)
-        pdf.set_text_color(*WHITE)
-        pdf.cell(BODY_W, 9, "INVESTMENT COMMITTEE MEMORANDUM", align="L")
+        # Property identity
+        story.append(Paragraph(_sp(self._name), P_PROP_NAME))
+        story.append(Paragraph(
+            f"Asset Class: {_sp(self._ac)}  ·  "
+            f"Property ID: {_sp(asset.property_id)}  ·  "
+            f"Prepared by: {_sp(self._by)}",
+            P_SUBTITLE,
+        ))
+        story.append(HRFlowable(
+            width=BODY_W, color=NAVY, thickness=1, spaceAfter=4 * mm,
+        ))
 
-        pdf.set_xy(MARGIN, 20)
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_text_color(*GOLD)
-        pdf.cell(BODY_W, 6, "STRICTLY CONFIDENTIAL  -  FOR INTERNAL USE ONLY", align="L")
+        # Investment Highlights (two-column KV table)
+        highlights = _two_col_kv_table([
+            ("Purchase Price",    _dollar(asset.purchase_price),
+             "Going-In Cap Rate", _pct(dcf.year_1_cap_rate)),
+            ("Loan Amount",       _dollar(asset._loan_amount),
+             "Year 1 NOI",        _dollar(pf[0].net_operating_income)),
+            ("Equity Invested",   _dollar(dcf.equity_invested),
+             "DSCR (Year 1)",     _x(dcf.dscr_year_1)),
+            ("Loan-to-Value",     _pct(asset.loan_to_value),
+             "Debt Yield",        _pct(dcf.debt_yield)),
+            ("Interest Rate",     _pct(asset.debt_interest_rate),
+             "Exit Cap Rate",     _pct(asset.exit_cap_rate)),
+            ("Total Rentable SF", f"{asset.total_sqft:,}",
+             "Base Rent PSF",     f"${asset.base_rent_psf:,.2f}"),
+        ])
+        story.append(KeepTogether([
+            Paragraph("INVESTMENT HIGHLIGHTS", P_SECTION),
+            highlights,
+        ]))
 
-        pdf.set_xy(PAGE_W - MARGIN - 35, 21)
-        pdf.set_font("Helvetica", "", 8)
-        pdf.set_text_color(*WHITE)
-        pdf.cell(35, 5, date.today().strftime("%B %d, %Y"), align="R")
+        # DCF Performance
+        irr_color  = GREEN if dcf.irr  >= 0 else RED
+        npv_color  = GREEN if dcf.npv  >= 0 else RED
+        em_color   = GREEN if dcf.equity_multiple >= 1.0 else RED
+        dcf_table  = _single_col_kv_table(
+            [
+                ("Levered IRR",          _pct(dcf.irr)),
+                ("NPV @ Discount Rate",  _dollar(dcf.npv)),
+                ("Equity Multiple",      _x(dcf.equity_multiple)),
+                ("Terminal NOI (Y11)",   _dollar(dcf.terminal_noi)),
+                ("Gross Exit Value",     _dollar(dcf.exit_value)),
+                ("Net Exit Proceeds",    _dollar(dcf.net_exit_proceeds)),
+            ],
+            highlight_rows={0, 1, 2},
+            value_colors={0: irr_color, 1: npv_color, 2: em_color},
+        )
+        story.append(KeepTogether([
+            Paragraph("DCF PERFORMANCE", P_SECTION),
+            dcf_table,
+        ]))
 
-        # ── property identity block ────────────────────────────────────
-        pdf.set_xy(MARGIN, 44)
-        pdf.set_font("Helvetica", "B", 20)
-        pdf.set_text_color(*NAVY)
-        pdf.cell(BODY_W, 10, _s(self._name), align="L")
-
-        pdf.set_xy(MARGIN, 55)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.set_text_color(*MUTED)
-        pdf.cell(BODY_W * 0.6, 6,
-                 f"Asset Class: {self._ac}  ·  Property ID: {self._asset.property_id}  ·  "
-                 f"Prepared by: {self._by}")
-
-        self._hline(63)
-
-        # ── two-column key metrics ─────────────────────────────────────
-        col_w = BODY_W / 2 - 3
-        left  = [
-            ("Purchase Price",      _dollar(self._asset.purchase_price)),
-            ("Loan Amount",         _dollar(self._asset._loan_amount)),
-            ("Equity Invested",     _dollar(self._dcf.equity_invested)),
-            ("Loan-to-Value",       _pct(self._asset.loan_to_value)),
-            ("Interest Rate",       _pct(self._asset.debt_interest_rate)),
-            ("Total Rentable SF",   f"{self._asset.total_sqft:,}"),
-        ]
-        right = [
-            ("Going-In Cap Rate",   _pct(self._dcf.year_1_cap_rate)),
-            ("Year 1 NOI",          _dollar(self._pf[0].net_operating_income)),
-            ("DSCR (Year 1)",       _x(self._dcf.dscr_year_1)),
-            ("Debt Yield",          _pct(self._dcf.debt_yield)),
-            ("Exit Cap Rate",       _pct(self._asset.exit_cap_rate)),
-            ("Base Rent PSF",       f"${self._asset.base_rent_psf:,.2f}"),
-        ]
-
-        pdf.set_xy(MARGIN, 68)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.set_text_color(*NAVY)
-        pdf.cell(BODY_W, 6, "INVESTMENT HIGHLIGHTS", align="L")
-
-        y_start = 75
-        row_h   = 7.2
-        for i, ((lk, lv), (rk, rv)) in enumerate(zip(left, right)):
-            y = y_start + i * row_h
-            fill = (i % 2 == 0)
-            if fill:
-                pdf.set_fill_color(*LIGHT)
-                pdf.rect(MARGIN, y, BODY_W, row_h, style="F")
-            self._kv_row(MARGIN,          y, col_w, row_h, lk, lv)
-            self._kv_row(MARGIN + col_w + 6, y, col_w, row_h, rk, rv)
-
-        # ── DCF performance strip ──────────────────────────────────────
-        y_dcf = y_start + len(left) * row_h + 6
-        self._hline(y_dcf - 2)
-        pdf.set_xy(MARGIN, y_dcf)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.set_text_color(*NAVY)
-        pdf.cell(BODY_W, 6, "DCF PERFORMANCE", align="L")
-
-        dcf_items = [
-            ("Levered IRR",         _pct(self._dcf.irr)),
-            ("NPV @ Discount Rate", _dollar(self._dcf.npv)),
-            ("Equity Multiple",     _x(self._dcf.equity_multiple)),
-            ("Terminal NOI",        _dollar(self._dcf.terminal_noi)),
-            ("Exit Value",          _dollar(self._dcf.exit_value)),
-            ("Net Exit Proceeds",   _dollar(self._dcf.net_exit_proceeds)),
-        ]
-
-        y_d   = y_dcf + 7
-        col3  = BODY_W / 3
-        for j, (k, v) in enumerate(dcf_items):
-            col = j % 3
-            row = j // 3
-            x   = MARGIN + col * col3
-            y   = y_d + row * row_h
-            if row % 2 == 0 and col == 0:
-                pdf.set_fill_color(*LIGHT)
-                pdf.rect(MARGIN, y, BODY_W, row_h, style="F")
-            self._kv_row(x, y, col3 - 2, row_h, k, v)
-
-        # ── alert status banner ────────────────────────────────────────
+        # Alert status banner
         status = self._report.get("overall_status", "OK")
-        color, label = {
+        banner_color, label = {
             "OK":       (GREEN, "OK  -  NO ACTIVE ALERTS  -  ALL METRICS WITHIN TARGETS"),
             "INFO":     (AMBER, "INFO  -  ELEVATED  -  MONITORING RECOMMENDED"),
             "WARNING":  (AMBER, "WARN  -  ONE OR MORE METRICS REQUIRE ATTENTION"),
@@ -362,526 +584,526 @@ class ICMemorandum:
             "ERROR":    (RED,   "ERROR  -  CONFIGURATION ISSUE DETECTED"),
         }.get(status, (MUTED, f"STATUS: {status}"))
 
-        banner_y = y_d + 2 * row_h + 8
-        self._banner(banner_y, label, color, height=10)
+        banner = Table(
+            [[Paragraph(_sp(label), P_BANNER_TXT)]],
+            colWidths=[BODY_W],
+        )
+        banner.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, -1), banner_color),
+            ("BOX",           (0, 0), (-1, -1), 1.0, NAVY),
+            ("TOPPADDING",    (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(Spacer(0, 3 * mm))
+        story.append(banner)
 
-        # ── alerts list (if any) ───────────────────────────────────────
+        # Active alerts list
         alerts = self._report.get("alerts", [])
         if alerts:
-            ay = banner_y + 14
-            pdf.set_xy(MARGIN, ay)
-            pdf.set_font("Helvetica", "B", 8)
-            pdf.set_text_color(*NAVY)
-            pdf.cell(BODY_W, 5, "ACTIVE ALERTS", align="L")
-            ay += 6
+            story.append(Paragraph("ACTIVE ALERTS", P_ALERT_HDR))
             for a in alerts:
-                sev_col = RED if a["severity"] == "CRITICAL" else AMBER if a["severity"] == "WARNING" else MUTED
-                pdf.set_xy(MARGIN, ay)
-                pdf.set_font("Helvetica", "B", 7.5)
-                pdf.set_text_color(*sev_col)
-                pdf.cell(28, 5, f"[{a['severity']}]")
-                pdf.set_font("Helvetica", "", 7.5)
-                pdf.set_text_color(*BLACK)
-                pdf.multi_cell(BODY_W - 28, 5, _s(a["message"]))
-                ay = pdf.get_y() + 1
+                sev = a["severity"]
+                sev_color = RED if sev == "CRITICAL" else AMBER if sev == "WARNING" else MUTED
+                row = Table(
+                    [[
+                        Paragraph(
+                            f"<b>[{_sp(sev)}]</b>",
+                            _ps(f"asev_{sev}", fontName="Helvetica-Bold",
+                                fontSize=7.5, textColor=sev_color, leading=10),
+                        ),
+                        Paragraph(
+                            _sp(a["message"]),
+                            _ps(f"amsg_{sev}", fontSize=7.5,
+                                textColor=BLACK, leading=10),
+                        ),
+                    ]],
+                    colWidths=[22 * mm, BODY_W - 22 * mm],
+                )
+                row.setStyle(TableStyle([
+                    ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+                    ("TOPPADDING",    (0, 0), (-1, -1), 1),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+                ]))
+                story.append(row)
 
-        self._footer(1)
+        return story
 
     # ------------------------------------------------------------------
     # Page 2 — 10-Year Pro Forma + Charts
     # ------------------------------------------------------------------
 
-    def _page_pro_forma(self) -> None:
-        pdf = self._pdf
-        pdf.add_page()
+    def _proforma_story(self) -> list:
+        pf = self._pf
+        story: list = []
 
-        self._section_header("10-YEAR PRO FORMA PROJECTION")
-
-        # ── column spec ───────────────────────────────────────────────
-        cols = [
-            ("Year",  10, "C"),
-            ("Rent PSF", 18, "R"),
-            ("PGI",   27, "R"),
-            ("EGI",   26, "R"),
-            ("OpEx",  23, "R"),
-            ("NOI",   26, "R"),
-            ("DS",    24, "R"),
-            ("LNCF",  26, "R"),  # sums to 180 ≤ BODY_W
+        # Column spec (widths sum to BODY_W)
+        col_w = [
+            0.055 * BODY_W,   # Year
+            0.095 * BODY_W,   # Rent PSF
+            0.135 * BODY_W,   # PGI
+            0.135 * BODY_W,   # EGI
+            0.125 * BODY_W,   # OpEx
+            0.135 * BODY_W,   # NOI
+            0.135 * BODY_W,   # Debt Svc
+            0.185 * BODY_W,   # LNCF
         ]
-        row_h = 5.8
+        headers = ["Year", "Rent PSF", "PGI", "EGI", "OpEx", "NOI", "Debt Svc", "LNCF"]
 
-        # header row
-        y = pdf.get_y() + 2
-        pdf.set_xy(MARGIN, y)
-        pdf.set_fill_color(*NAVY)
-        pdf.set_text_color(*WHITE)
-        pdf.set_font("Helvetica", "B", 7.5)
-        for label, w, align in cols:
-            pdf.cell(w, row_h + 0.5, label, border=0, align=align, fill=True)
-        pdf.ln()
+        data = [headers]
+        for yr in pf:
+            data.append([
+                str(yr.year),
+                f"${yr.rent_psf:.2f}",
+                _m(yr.potential_gross_income),
+                _m(yr.effective_gross_income),
+                _m(yr.operating_expenses),
+                _m(yr.net_operating_income),
+                _m(yr.debt_service),
+                _m(yr.levered_net_cash_flow),
+            ])
 
-        # data rows
-        for i, yr in enumerate(self._pf):
-            y = pdf.get_y()
-            fill = (i % 2 == 0)
-            if fill:
-                pdf.set_fill_color(*LIGHT)
-            else:
-                pdf.set_fill_color(*WHITE)
-            pdf.set_text_color(*BLACK)
-            pdf.set_font("Helvetica", "", 7)
+        cmds = [
+            ("BOX",       (0, 0), (-1, -1), 0.8, NAVY),
+            ("INNERGRID", (0, 0), (-1, -1), 0.35, SLATE),
+            *_financial_header_style(1),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [LIGHT, WHITE]),
+            ("FONTNAME",  (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE",  (0, 1), (-1, -1), 7),
+            ("TEXTCOLOR", (0, 1), (-1, -1), BLACK),
+            ("ALIGN",     (0, 1), (0, -1),  "CENTER"),
+            ("ALIGN",     (1, 1), (-1, -1), "RIGHT"),
+            ("VALIGN",    (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING",    (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+        ]
+        # Per-row LNCF color (col 7)
+        for i, yr in enumerate(pf, start=1):
+            c = GREEN if yr.levered_net_cash_flow >= 0 else RED
+            cmds.append(("TEXTCOLOR", (7, i), (7, i), c))
 
-            lncf_col = GREEN if yr.levered_net_cash_flow >= 0 else RED
-            row_vals = [
-                (str(yr.year),                        "C", BLACK),
-                (f"${yr.rent_psf:.2f}",               "R", BLACK),
-                (_m(yr.potential_gross_income),        "R", BLACK),
-                (_m(yr.effective_gross_income),        "R", BLACK),
-                (_m(yr.operating_expenses),            "R", BLACK),
-                (_m(yr.net_operating_income),          "R", BLACK),
-                (_m(yr.debt_service),                  "R", BLACK),
-                (_m(yr.levered_net_cash_flow),         "R", lncf_col),
-            ]
-            for (val, align, color), (_, w, _align) in zip(row_vals, cols):
-                pdf.set_text_color(*color)
-                pdf.cell(w, row_h, val, border=0, align=align, fill=fill)
-            pdf.ln()
+        pf_table = Table(data, colWidths=col_w, repeatRows=1)
+        pf_table.setStyle(TableStyle(cmds))
 
-        # ── charts ────────────────────────────────────────────────────
-        chart_y = pdf.get_y() + 5
-        self._hline(chart_y - 2)
-        pdf.set_xy(MARGIN, chart_y)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.set_text_color(*NAVY)
-        pdf.cell(BODY_W, 5, "CASH FLOW ANALYSIS CHARTS", align="L")
+        story.append(KeepTogether([
+            Paragraph("10-YEAR CASH FLOW SUMMARY", P_SECTION),
+            pf_table,
+        ]))
 
-        chart_w    = (BODY_W - 6) / 2
-        chart_h    = 56
-        chart_y   += 7
+        # Charts
+        chart_w_mm = (187.9 - 6) / 2   # ~90.95 mm
+        chart_h_mm = 56.0
+        chart_w_pt = chart_w_mm * mm
+        chart_h_pt = chart_h_mm * mm
 
-        buf1 = _chart_noi_vs_ds(self._pf,
-                                 w_px=int(chart_w * 4.5),
-                                 h_px=int(chart_h * 4.5))
-        buf2 = _chart_cumulative_cf(self._pf,
-                                     equity=self._dcf.equity_invested,
-                                     w_px=int(chart_w * 4.5),
-                                     h_px=int(chart_h * 4.5))
+        buf1 = _chart_noi_vs_ds(
+            pf,
+            w_px=int(chart_w_mm * 4.5),
+            h_px=int(chart_h_mm * 4.5),
+        )
+        buf2 = _chart_cumulative_cf(
+            pf,
+            equity=self._dcf.equity_invested,
+            w_px=int(chart_w_mm * 4.5),
+            h_px=int(chart_h_mm * 4.5),
+        )
+        img1 = Image(buf1, width=chart_w_pt, height=chart_h_pt)
+        img2 = Image(buf2, width=chart_w_pt, height=chart_h_pt)
 
-        pdf.image(buf1, x=MARGIN,               y=chart_y, w=chart_w, h=chart_h)
-        pdf.image(buf2, x=MARGIN + chart_w + 6, y=chart_y, w=chart_w, h=chart_h)
+        chart_table = Table(
+            [[img1, img2]],
+            colWidths=[chart_w_pt, chart_w_pt],
+            spaceBefore=4 * mm,
+        )
+        chart_table.setStyle(TableStyle([
+            ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+            ("TOPPADDING",    (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ]))
 
-        self._footer(2)
+        story.append(Spacer(0, 4 * mm))
+        story.append(HRFlowable(width=BODY_W, color=NAVY, thickness=0.5,
+                                 spaceAfter=2 * mm))
+        story.append(KeepTogether([
+            Paragraph("CASH FLOW ANALYSIS CHARTS", P_SECTION),
+            chart_table,
+        ]))
+
+        return story
 
     # ------------------------------------------------------------------
-    # Page 3 — DCF Summary, Lease Roll, Recommendation
+    # Page 3 — DCF Summary, Equity Waterfall, Lease Roll, Recommendation
     # ------------------------------------------------------------------
 
-    def _page_dcf_recommendation(self) -> None:
-        pdf = self._pdf
-        pdf.add_page()
+    def _dcf_story(self) -> list:
+        asset, dcf, pf = self._asset, self._dcf, self._pf
+        story: list = []
 
-        self._section_header("DISCOUNTED CASH FLOW ANALYSIS & RECOMMENDATION")
+        # DCF Summary table
+        irr_c = GREEN if dcf.irr >= 0 else RED
+        npv_c = GREEN if dcf.npv >= 0 else RED
+        em_c  = GREEN if dcf.equity_multiple >= 1.0 else RED
+        dcf_table = _single_col_kv_table(
+            [
+                ("Equity Invested",      _dollar(dcf.equity_invested)),
+                ("Year 1 NOI",           _dollar(pf[0].net_operating_income)),
+                ("Year 10 NOI",          _dollar(pf[9].net_operating_income)),
+                ("Terminal NOI (Y11)",   _dollar(dcf.terminal_noi)),
+                ("Exit Cap Rate",        _pct(asset.exit_cap_rate)),
+                ("Gross Exit Value",     _dollar(dcf.exit_value)),
+                ("Loan Balance at Exit", _dollar(dcf.loan_balance_at_exit)),
+                ("Net Exit Proceeds",    _dollar(dcf.net_exit_proceeds)),
+                ("NPV",                  _dollar(dcf.npv)),
+                ("Levered IRR",          _pct(dcf.irr)),
+                ("Equity Multiple",      _x(dcf.equity_multiple)),
+                ("Discount Rate",        _pct(asset.discount_rate)),
+            ],
+            highlight_rows={8, 9, 10},
+            value_colors={8: npv_c, 9: irr_c, 10: em_c},
+        )
+        story.append(KeepTogether([
+            Paragraph("DCF SUMMARY", P_SECTION),
+            dcf_table,
+        ]))
 
-        # ── DCF summary table ──────────────────────────────────────────
-        dcf_rows = [
-            ("Equity Invested",      _dollar(self._dcf.equity_invested)),
-            ("Year 1 NOI",           _dollar(self._pf[0].net_operating_income)),
-            ("Year 10 NOI",          _dollar(self._pf[9].net_operating_income)),
-            ("Terminal NOI (Y11)",   _dollar(self._dcf.terminal_noi)),
-            ("Exit Cap Rate",        _pct(self._asset.exit_cap_rate)),
-            ("Gross Exit Value",     _dollar(self._dcf.exit_value)),
-            ("Loan Balance at Exit", _dollar(self._dcf.loan_balance_at_exit)),
-            ("Net Exit Proceeds",    _dollar(self._dcf.net_exit_proceeds)),
-            ("NPV",                  _dollar(self._dcf.npv)),
-            ("Levered IRR",          _pct(self._dcf.irr)),
-            ("Equity Multiple",      _x(self._dcf.equity_multiple)),
-            ("Discount Rate",        _pct(self._asset.discount_rate)),
-        ]
-
-        col1 = BODY_W * 0.55
-        col2 = BODY_W - col1
-        row_h = 6.4
-
-        pdf.set_xy(MARGIN, pdf.get_y() + 2)
-        pdf.set_fill_color(*NAVY)
-        pdf.set_text_color(*WHITE)
-        pdf.set_font("Helvetica", "B", 8)
-        pdf.cell(col1, row_h, "Metric", fill=True, border=0)
-        pdf.cell(col2, row_h, "Value",  fill=True, border=0, align="R")
-        pdf.ln()
-
-        for i, (k, v) in enumerate(dcf_rows):
-            fill = (i % 2 == 0)
-            pdf.set_fill_color(*(LIGHT if fill else WHITE))
-            pdf.set_text_color(*BLACK)
-            pdf.set_font("Helvetica", "B" if i in (8, 9, 10) else "", 8)
-            pdf.cell(col1, row_h, k, fill=fill, border=0)
-            # color-code IRR and NPV based on sign
-            if k in ("Levered IRR", "NPV", "Equity Multiple"):
-                raw = self._dcf.irr if "IRR" in k else self._dcf.npv if "NPV" in k else self._dcf.equity_multiple
-                pdf.set_text_color(*(GREEN if raw >= 0 else RED))
-            pdf.cell(col2, row_h, v, fill=fill, border=0, align="R")
-            pdf.set_text_color(*BLACK)
-            pdf.ln()
-
-        # ── equity waterfall ───────────────────────────────────────────
+        # Equity Waterfall
         if self._wf:
             wf = self._wf
-            pdf.ln(4)
-            self._hline(pdf.get_y())
-            pdf.ln(2)
-            pdf.set_font("Helvetica", "B", 9)
-            pdf.set_text_color(*NAVY)
-            pdf.cell(BODY_W, 5, "EQUITY WATERFALL  (90% LP / 10% GP  |  Hurdles: 8% / 12%)", align="L")
-            pdf.ln(7)
-
-            # two-column side-by-side: LP left, GP right
-            half  = BODY_W / 2 - 3
-            wrow  = 6.0
-            lx    = MARGIN
-            rx    = MARGIN + half + 6
-
-            def _wf_header(x: float, label: str) -> None:
-                pdf.set_xy(x, pdf.get_y())
-                pdf.set_fill_color(*NAVY)
-                pdf.set_text_color(*WHITE)
-                pdf.set_font("Helvetica", "B", 8)
-                pdf.cell(half, wrow, label, fill=True, border=0, align="C")
-
-            row_y = pdf.get_y()
-            _wf_header(lx, "INVESTOR  (LP  90%)")
-            pdf.set_xy(rx, row_y)
-            _wf_header(rx, "SPONSOR   (GP  10%)")
-            pdf.ln()
-
-            lp_rows = [
-                ("LP Equity",    _dollar(wf.lp_equity)),
-                ("LP IRR",       _pct(wf.lp_irr)),
-                ("LP Eq. Multiple", _x(wf.lp_equity_multiple)),
-                ("LP Distributions", _dollar(wf.lp_distributions)),
-            ]
-            gp_rows = [
-                ("GP Equity",    _dollar(wf.gp_equity)),
-                ("GP IRR",       _pct(wf.gp_irr)),
-                ("GP Eq. Multiple", _x(wf.gp_equity_multiple)),
-                ("GP Distributions", _dollar(wf.gp_distributions)),
+            wf_hdr = [
+                Paragraph(
+                    "EQUITY WATERFALL  (90% LP / 10% GP  |  Hurdles: 8% / 12%)",
+                    P_SECTION,
+                )
             ]
 
-            for i, ((lk, lv), (rk, rv)) in enumerate(zip(lp_rows, gp_rows)):
-                row_y = pdf.get_y()
-                fill  = (i % 2 == 0)
-                if fill:
-                    pdf.set_fill_color(*LIGHT)
-                    pdf.rect(lx, row_y, half, wrow, style="F")
-                    pdf.rect(rx, row_y, half, wrow, style="F")
-                irr_row = (lk == "LP IRR" or rk == "GP IRR")
-                lv_col  = GREEN if (irr_row and wf.lp_irr  >= 0) else BLACK
-                rv_col  = GREEN if (irr_row and wf.gp_irr  >= 0) else BLACK
-                self._kv_row(lx, row_y, half, wrow, lk, lv)
-                pdf.set_text_color(*lv_col)
-                self._kv_row(rx, row_y, half, wrow, rk, rv)
-                pdf.set_text_color(*rv_col)
-                pdf.set_xy(lx, row_y + wrow)
+            half_w = (BODY_W - 4 * mm) / 2
 
-            # tier distribution summary
-            pdf.ln(2)
-            tier_y = pdf.get_y()
-            pdf.set_fill_color(*LIGHT)
-            pdf.rect(lx, tier_y, BODY_W, wrow, style="F")
-            t_col = BODY_W / 3
-            tiers = [
-                (f"Tier 1 (0-8%)   {_dollar(wf.tier1_distributed)}",  0),
-                (f"Tier 2 (8-12%)  {_dollar(wf.tier2_distributed)}",  1),
-                (f"Tier 3 (12%+)   {_dollar(wf.tier3_distributed)}",  2),
-            ]
-            for label, col in tiers:
-                pdf.set_xy(lx + col * t_col, tier_y)
-                pdf.set_font("Helvetica", "", 7.5)
-                pdf.set_text_color(*MUTED)
-                pdf.cell(t_col, wrow, label, align="C")
-            pdf.ln(wrow + 3)
+            def _wf_side(equity, irr, em, distrib):
+                irr_c2 = GREEN if irr >= 0 else RED
+                return _single_col_kv_table(
+                    [
+                        ("Equity",        _dollar(equity)),
+                        ("IRR",           _pct(irr)),
+                        ("Equity Multiple", _x(em)),
+                        ("Distributions", _dollar(distrib)),
+                    ],
+                    highlight_rows={1},
+                    value_colors={1: irr_c2},
+                )
 
-        # ── lease roll ─────────────────────────────────────────────────
+            lp_tbl = _wf_side(wf.lp_equity, wf.lp_irr,
+                               wf.lp_equity_multiple, wf.lp_distributions)
+            gp_tbl = _wf_side(wf.gp_equity, wf.gp_irr,
+                               wf.gp_equity_multiple, wf.gp_distributions)
+
+            # Side-by-side header row
+            side_hdr = Table(
+                [[
+                    Paragraph("<b>INVESTOR  (LP  90%)</b>",
+                               _ps("lp_hdr", fontName="Helvetica-Bold",
+                                   fontSize=8, textColor=WHITE,
+                                   leading=11, alignment=TA_CENTER)),
+                    Paragraph("<b>SPONSOR   (GP  10%)</b>",
+                               _ps("gp_hdr", fontName="Helvetica-Bold",
+                                   fontSize=8, textColor=WHITE,
+                                   leading=11, alignment=TA_CENTER)),
+                ]],
+                colWidths=[half_w, half_w],
+            )
+            side_hdr.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, -1), NAVY),
+                ("BOX",           (0, 0), (-1, -1), 0.8, NAVY),
+                ("LINEAFTER",     (0, 0), (0, -1),  1.2, GOLD),
+                ("TOPPADDING",    (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LINEBELOW",     (0, 0), (-1, -1), 1.5, GOLD),
+            ]))
+
+            sides = Table(
+                [[lp_tbl, gp_tbl]],
+                colWidths=[half_w, half_w],
+            )
+            sides.setStyle(TableStyle([
+                ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+                ("TOPPADDING",    (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ("LINEAFTER",     (0, 0), (0, -1),  1.2, NAVY),
+            ]))
+
+            # Tier summary strip
+            tier_data = [[
+                f"Tier 1 (0-8%)   {_dollar(wf.tier1_distributed)}",
+                f"Tier 2 (8-12%)  {_dollar(wf.tier2_distributed)}",
+                f"Tier 3 (12%+)   {_dollar(wf.tier3_distributed)}",
+            ]]
+            tier_tbl = Table(tier_data, colWidths=[BODY_W / 3] * 3)
+            tier_tbl.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, -1), LIGHT),
+                ("BOX",           (0, 0), (-1, -1), 0.8, NAVY),
+                ("INNERGRID",     (0, 0), (-1, -1), 0.35, SLATE),
+                ("FONTNAME",      (0, 0), (-1, -1), "Helvetica"),
+                ("FONTSIZE",      (0, 0), (-1, -1), 7.5),
+                ("TEXTCOLOR",     (0, 0), (-1, -1), MUTED),
+                ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING",    (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]))
+
+            story.append(KeepTogether(wf_hdr + [side_hdr, sides, tier_tbl]))
+
+        # Lease Roll
         lease_roll = self._report.get("lease_roll", [])
         if lease_roll:
-            pdf.ln(4)
-            self._hline(pdf.get_y())
-            pdf.ln(2)
-            pdf.set_font("Helvetica", "B", 9)
-            pdf.set_text_color(*NAVY)
-            pdf.cell(BODY_W, 5, "ACTIVE LEASE ROLL", align="L")
-            pdf.ln(6)
-
-            lr_cols = [
-                ("Tenant",        60, "L"),
-                ("SF",            22, "R"),
-                ("Rent PSF",      22, "R"),
-                ("Annual Rent",   32, "R"),
-                ("Lease End",     28, "C"),
-                ("Delinquent",    22, "C"),
+            lr_col_w = [
+                0.30 * BODY_W,   # Tenant
+                0.11 * BODY_W,   # SF
+                0.11 * BODY_W,   # Rent PSF
+                0.16 * BODY_W,   # Annual Rent
+                0.16 * BODY_W,   # Lease End
+                0.16 * BODY_W,   # Delinquent
             ]
-            lrow_h = 5.8
+            lr_hdrs = ["Tenant", "SF", "Rent PSF", "Annual Rent", "Lease End", "Delinquent"]
+            lr_data = [lr_hdrs]
+            for t in lease_roll:
+                delinq = bool(t.get("is_delinquent"))
+                lr_data.append([
+                    _s(t["tenant_name"][:28]),
+                    f"{t['square_footage']:,}",
+                    f"${t['base_rent_psf']:.2f}",
+                    _dollar(t["annual_rent"]),
+                    str(t["lease_end"]),
+                    "YES" if delinq else "-",
+                ])
 
-            pdf.set_fill_color(*NAVY)
-            pdf.set_text_color(*WHITE)
-            pdf.set_font("Helvetica", "B", 7.5)
-            for lbl, w, align in lr_cols:
-                pdf.cell(w, lrow_h, lbl, border=0, align=align, fill=True)
-            pdf.ln()
+            lr_cmds = [
+                ("BOX",       (0, 0), (-1, -1), 0.8, NAVY),
+                ("INNERGRID", (0, 0), (-1, -1), 0.35, SLATE),
+                *_financial_header_style(1),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [LIGHT, WHITE]),
+                ("FONTNAME",  (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE",  (0, 1), (-1, -1), 7),
+                ("TEXTCOLOR", (0, 1), (-1, -1), BLACK),
+                ("ALIGN",     (0, 1), (0, -1),  "LEFT"),
+                ("ALIGN",     (1, 1), (-1, -1), "RIGHT"),
+                ("ALIGN",     (4, 1), (5, -1),  "CENTER"),
+                ("VALIGN",    (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING",    (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+            ]
+            # Delinquent tenant name + flag in red
+            for i, t in enumerate(lease_roll, start=1):
+                if t.get("is_delinquent"):
+                    lr_cmds.append(("TEXTCOLOR", (0, i), (0, i), RED))
+                    lr_cmds.append(("TEXTCOLOR", (5, i), (5, i), RED))
+                    lr_cmds.append(("FONTNAME",  (5, i), (5, i), "Helvetica-Bold"))
 
-            for i, t in enumerate(lease_roll):
-                fill    = (i % 2 == 0)
-                delinq  = bool(t.get("is_delinquent"))
-                pdf.set_fill_color(*(LIGHT if fill else WHITE))
-                pdf.set_font("Helvetica", "", 7)
-                row_data = [
-                    (_s(t["tenant_name"][:28]),            "L", RED if delinq else BLACK),
-                    (f"{t['square_footage']:,}",           "R", BLACK),
-                    (f"${t['base_rent_psf']:.2f}",         "R", BLACK),
-                    (_dollar(t["annual_rent"]),            "R", BLACK),
-                    (str(t["lease_end"]),                  "C", BLACK),
-                    ("YES" if delinq else "-",              "C", RED if delinq else MUTED),
-                ]
-                for (val, align, color), (_, w, _align) in zip(row_data, lr_cols):
-                    pdf.set_text_color(*color)
-                    pdf.cell(w, lrow_h, val, border=0, align=align, fill=fill)
-                pdf.ln()
+            lr_table = Table(lr_data, colWidths=lr_col_w, repeatRows=1)
+            lr_table.setStyle(TableStyle(lr_cmds))
 
-        # ── recommendation banner ──────────────────────────────────────
-        rec, rationale, color = self._recommendation
-        pdf.ln(6)
-        banner_y = pdf.get_y()
+            story.append(KeepTogether([
+                Paragraph("ACTIVE LEASE ROLL", P_SECTION),
+                lr_table,
+            ]))
 
-        # outer frame
-        pdf.set_fill_color(*color)
-        pdf.rect(MARGIN, banner_y, BODY_W, 26, style="F")
+        # Recommendation banner
+        rec, rationale, rec_color = self._recommendation
+        rec_table = Table(
+            [
+                [Paragraph("INVESTMENT COMMITTEE RECOMMENDATION", P_REC_LABEL)],
+                [Paragraph(_sp(rec), P_REC_MAIN)],
+                [Paragraph(_sp(rationale), P_REC_NOTE)],
+            ],
+            colWidths=[BODY_W],
+        )
+        rec_table.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, -1), rec_color),
+            ("BOX",           (0, 0), (-1, -1), 1.0, NAVY),
+            ("TOPPADDING",    (0, 0), (0, 0),   6),
+            ("TOPPADDING",    (0, 1), (0, 1),   2),
+            ("TOPPADDING",    (0, 2), (0, 2),   2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ]))
+        story.append(Spacer(0, 4 * mm))
+        story.append(rec_table)
 
-        # label
-        pdf.set_xy(MARGIN, banner_y + 4)
-        pdf.set_font("Helvetica", "", 8)
-        pdf.set_text_color(*WHITE)
-        pdf.cell(BODY_W, 5, "INVESTMENT COMMITTEE RECOMMENDATION", align="C")
-
-        # verdict
-        pdf.set_xy(MARGIN, banner_y + 10)
-        pdf.set_font("Helvetica", "B", 20)
-        pdf.cell(BODY_W, 10, _s(rec), align="C")
-
-        # rationale
-        pdf.set_xy(MARGIN, banner_y + 20)
-        pdf.set_font("Helvetica", "I", 7.5)
-        pdf.cell(BODY_W, 5, _s(rationale), align="C")
-
-        self._footer(3)
-
-    # ------------------------------------------------------------------
-    # Drawing helpers
-    # ------------------------------------------------------------------
-
-    def _section_header(self, title: str) -> None:
-        pdf = self._pdf
-        pdf.set_fill_color(*NAVY)
-        pdf.rect(0, 0, PAGE_W, 18, style="F")
-        pdf.set_xy(MARGIN, 5)
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.set_text_color(*WHITE)
-        pdf.cell(BODY_W * 0.7, 8, _s(title), align="L")
-        pdf.set_xy(MARGIN, 5)
-        pdf.set_font("Helvetica", "", 8)
-        pdf.set_text_color(*GOLD)
-        pdf.cell(BODY_W, 8, _s(self._name), align="R")
-        pdf.set_xy(MARGIN, 22)
-
-    def _hline(self, y: float) -> None:
-        pdf = self._pdf
-        pdf.set_draw_color(*NAVY)
-        pdf.line(MARGIN, y, MARGIN + BODY_W, y)
-
-    def _kv_row(self, x: float, y: float, w: float, h: float,
-                key: str, val: str) -> None:
-        pdf = self._pdf
-        pdf.set_xy(x, y)
-        pdf.set_font("Helvetica", "", 8)
-        pdf.set_text_color(*MUTED)
-        pdf.cell(w * 0.58, h, key)
-        pdf.set_font("Helvetica", "B", 8)
-        pdf.set_text_color(*NAVY)
-        pdf.cell(w * 0.42, h, val, align="R")
-
-    def _banner(self, y: float, text: str, color: tuple,
-                height: float = 10) -> None:
-        pdf = self._pdf
-        pdf.set_fill_color(*color)
-        pdf.rect(MARGIN, y, BODY_W, height, style="F")
-        pdf.set_xy(MARGIN, y + (height - 5) / 2)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.set_text_color(*WHITE)
-        pdf.cell(BODY_W, 5, text, align="C")
-
-    def _footer(self, page_num: int) -> None:
-        pdf = self._pdf
-        # Disable auto_page_break so the footer always lands on the current page,
-        # not on a new one triggered by set_y being past the break threshold.
-        pdf.set_auto_page_break(auto=False)
-        pdf.set_y(PAGE_H - 10)
-        pdf.set_font("Helvetica", "I", 6.5)
-        pdf.set_text_color(*MUTED)
-        pdf.cell(BODY_W * 0.6, 5,
-                 "CONFIDENTIAL  -  This document contains proprietary financial projections.",
-                 align="L")
-        pdf.cell(BODY_W * 0.4, 5, f"Page {page_num} of {self._total_pages}", align="R")
-        pdf.set_auto_page_break(auto=True, margin=14)
+        return story
 
     # ------------------------------------------------------------------
-    # Page 4 — Macro Sensitivity Analysis
+    # Page 4 — Macro Sensitivity Matrix
     # ------------------------------------------------------------------
 
-    def _page_sensitivity_matrix(self) -> None:
-        pdf = self._pdf
-        pdf.add_page()
-        self._section_header("MACRO SENSITIVITY ANALYSIS")
+    def _sensitivity_story(self) -> list:
+        sm = self._sm
+        if sm is None:
+            return []
 
-        sm        = self._sm
         cap_rates = sm.cap_rate_range
         vacancies = sm.vacancy_range
         n_cols    = len(cap_rates)
 
-        # Subtitle
-        pdf.set_xy(MARGIN, pdf.get_y() + 2)
-        pdf.set_font("Helvetica", "", 8)
-        pdf.set_text_color(*MUTED)
-        subtitle = (
-            f"Parametric stress test: {len(vacancies)} vacancy levels x "
-            f"{n_cols} exit cap rate scenarios  -  Combined IRR with LP / GP split"
-        )
-        pdf.cell(BODY_W, 5, _s(subtitle), align="L")
-        pdf.ln(9)
+        story: list = []
 
-        # Table layout
-        label_w = 32.0
-        col_w   = (BODY_W - label_w) / n_cols
-        hdr_h   = 7.5
-        row_h   = 15.0
+        # Subtitle
+        story.append(Paragraph(
+            f"Parametric stress test: {len(vacancies)} vacancy levels × "
+            f"{n_cols} exit cap rate scenarios  —  "
+            f"Combined IRR with LP / GP split",
+            P_SUBTITLE,
+        ))
+        story.append(Spacer(0, 3 * mm))
 
         # Header row
-        y = pdf.get_y()
-        pdf.set_fill_color(*NAVY)
-        pdf.set_text_color(*WHITE)
-        pdf.set_font("Helvetica", "B", 8)
-        pdf.set_xy(MARGIN, y)
-        pdf.cell(label_w, hdr_h, "VACANCY  \\  EXIT CAP", fill=True, border=0, align="C")
-        for c in cap_rates:
-            pdf.cell(col_w, hdr_h, f"{c:.2%}  Exit Cap", fill=True, border=0, align="C")
-        pdf.ln()
+        label_w = 32 * mm
+        col_w   = (BODY_W - label_w) / n_cols
+        hdr_row = ["VACANCY \\ EXIT CAP"] + [f"{c:.2%} Exit Cap" for c in cap_rates]
 
-        # Data rows
-        for i, v in enumerate(vacancies):
-            y    = pdf.get_y()
-            fill = (i % 2 == 0)
-            pdf.set_fill_color(*(LIGHT if fill else WHITE))
-            pdf.rect(MARGIN, y, BODY_W, row_h, style="F")
-
-            # Vacancy label — centred vertically in the row
-            pdf.set_xy(MARGIN, y + (row_h - 5) / 2)
-            pdf.set_font("Helvetica", "B", 9)
-            pdf.set_text_color(*NAVY)
-            pdf.cell(label_w, 5, f"{v:.1%}", align="C")
-
-            # Data cells: Combined IRR (large, colored) then LP/GP split below
-            for j, c in enumerate(cap_rates):
+        # Data rows: each cell has Combined IRR on top, LP/GP below
+        # Encode as Paragraphs inside cells for two-line layout
+        data = [hdr_row]
+        for v in vacancies:
+            row = [f"{v:.1%} Vacancy"]
+            for c in cap_rates:
                 cell = sm.get(v, c)
-                cx   = MARGIN + label_w + j * col_w
-
                 if cell is None:
-                    pdf.set_xy(cx, y + (row_h - 5) / 2)
-                    pdf.set_font("Helvetica", "", 8)
-                    pdf.set_text_color(*MUTED)
-                    pdf.cell(col_w, 5, "N/A", align="C")
+                    row.append(Paragraph("N/A", P_SMALL))
                     continue
+                irr = cell.combined_irr
+                irr_col = GREEN if irr >= 0.12 else (AMBER if irr >= 0.08 else RED)
+                irr_para = Paragraph(
+                    f"<b>{irr:.2%}</b>",
+                    _ps(f"irr_{v}_{c}", fontName="Helvetica-Bold", fontSize=10,
+                        textColor=irr_col, leading=13, alignment=TA_CENTER),
+                )
+                sub_para = Paragraph(
+                    f"LP {cell.lp_irr:.1%}  /  GP {cell.gp_irr:.1%}",
+                    _ps(f"sub_{v}_{c}", fontSize=7, textColor=MUTED,
+                        leading=9, alignment=TA_CENTER),
+                )
+                # Wrap in a mini-table to stack vertically
+                cell_inner = Table(
+                    [[irr_para], [sub_para]],
+                    colWidths=[col_w - 2],
+                )
+                cell_inner.setStyle(TableStyle([
+                    ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+                    ("TOPPADDING",    (0, 0), (-1, -1), 1),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+                ]))
+                row.append(cell_inner)
+            data.append(row)
 
-                irr       = cell.combined_irr
-                irr_color = GREEN if irr >= 0.12 else (AMBER if irr >= 0.08 else RED)
+        col_widths = [label_w] + [col_w] * n_cols
 
-                # Line 1: Combined IRR
-                pdf.set_xy(cx, y + 2.5)
-                pdf.set_font("Helvetica", "B", 10)
-                pdf.set_text_color(*irr_color)
-                pdf.cell(col_w, 5, f"{irr:.2%}", align="C")
-
-                # Line 2: LP / GP split
-                pdf.set_xy(cx, y + 8.5)
-                pdf.set_font("Helvetica", "", 7)
-                pdf.set_text_color(*MUTED)
-                pdf.cell(col_w, 4,
-                         f"LP {cell.lp_irr:.1%}  /  GP {cell.gp_irr:.1%}",
-                         align="C")
-
-            pdf.set_xy(MARGIN, y + row_h)
-
-        # Divider
-        div_y = pdf.get_y() + 3
-        self._hline(div_y)
-
-        # Legend strip
-        leg_y   = div_y + 4
-        leg_col = BODY_W / 3
-        pdf.set_fill_color(*LIGHT)
-        pdf.rect(MARGIN, leg_y, BODY_W, 8, style="F")
-
-        legend_items = [
-            ("Combined IRR >= 12%  (Outperforms Hurdle)", GREEN),
-            ("Combined IRR  8-12%  (Threshold Zone)",     AMBER),
-            ("Combined IRR  < 8%   (Below Hurdle)",       RED),
+        sm_cmds = [
+            ("BOX",       (0, 0), (-1, -1), 0.8, NAVY),
+            ("INNERGRID", (0, 0), (-1, -1), 0.35, SLATE),
+            *_financial_header_style(1),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [LIGHT, WHITE]),
+            ("FONTNAME",  (0, 1), (0, -1), "Helvetica-Bold"),
+            ("FONTSIZE",  (0, 1), (0, -1), 9),
+            ("TEXTCOLOR", (0, 1), (0, -1), NAVY),
+            ("ALIGN",     (0, 1), (0, -1), "CENTER"),
+            ("VALIGN",    (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
         ]
-        for k, (label, color) in enumerate(legend_items):
-            bx = MARGIN + k * leg_col
-            pdf.set_fill_color(*color)
-            pdf.rect(bx + 3, leg_y + 2.5, 4, 3.5, style="F")
-            pdf.set_xy(bx + 9, leg_y + 1.5)
-            pdf.set_font("Helvetica", "", 7)
-            pdf.set_text_color(*MUTED)
-            pdf.cell(leg_col - 9, 5, _s(label))
+        sm_table = Table(data, colWidths=col_widths, repeatRows=1)
+        sm_table.setStyle(TableStyle(sm_cmds))
 
-        # Base-case callout (rendered only if base case falls within the grid)
-        base_v    = self._asset.vacancy_rate
-        base_c    = self._asset.exit_cap_rate
-        base_cell = sm.get(base_v, base_c)
+        story.append(KeepTogether([
+            Paragraph("IRR SENSITIVITY MATRIX", P_SECTION),
+            sm_table,
+        ]))
 
+        # Legend
+        story.append(Spacer(0, 3 * mm))
+        leg_col_w = BODY_W / 3
+        legend_data = [[
+            f"Combined IRR >= 12%  (Outperforms Hurdle)",
+            f"Combined IRR  8-12%  (Threshold Zone)",
+            f"Combined IRR  < 8%   (Below Hurdle)",
+        ]]
+        leg_tbl = Table(legend_data, colWidths=[leg_col_w] * 3)
+        leg_tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (0, 0), GREEN),
+            ("BACKGROUND",    (1, 0), (1, 0), AMBER),
+            ("BACKGROUND",    (2, 0), (2, 0), RED),
+            ("BOX",           (0, 0), (-1, -1), 0.8, NAVY),
+            ("INNERGRID",     (0, 0), (-1, -1), 0.35, SLATE),
+            ("TEXTCOLOR",     (0, 0), (-1, -1), WHITE),
+            ("FONTNAME",      (0, 0), (-1, -1), "Helvetica"),
+            ("FONTSIZE",      (0, 0), (-1, -1), 7),
+            ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(leg_tbl)
+
+        # Base-case callout
+        base_cell = sm.get(self._asset.vacancy_rate, self._asset.exit_cap_rate)
         if base_cell:
-            call_y = leg_y + 12
-            pdf.set_fill_color(*LIGHT)
-            pdf.rect(MARGIN, call_y, BODY_W, 9, style="F")
-            pdf.set_xy(MARGIN + 4, call_y + 2)
-            pdf.set_font("Helvetica", "B", 8)
-            pdf.set_text_color(*NAVY)
-            pdf.cell(22, 5, "Base Case:")
-            pdf.set_font("Helvetica", "", 8)
-            pdf.set_text_color(*BLACK)
-            pdf.cell(
-                BODY_W - 26, 5,
-                _s(
-                    f"Vacancy {base_v:.1%}  |  Exit Cap {base_c:.2%}  ->  "
-                    f"Combined IRR {base_cell.combined_irr:.2%}  "
-                    f"|  LP IRR {base_cell.lp_irr:.2%}  "
-                    f"|  GP IRR {base_cell.gp_irr:.2%}"
-                ),
+            story.append(Spacer(0, 3 * mm))
+            callout = Table(
+                [[
+                    Paragraph("<b>Base Case:</b>",
+                               _ps("bc_lbl", fontName="Helvetica-Bold",
+                                   fontSize=8, textColor=NAVY, leading=11)),
+                    Paragraph(
+                        _sp(
+                            f"Vacancy {self._asset.vacancy_rate:.1%}  |  "
+                            f"Exit Cap {self._asset.exit_cap_rate:.2%}  ->  "
+                            f"Combined IRR {base_cell.combined_irr:.2%}  "
+                            f"|  LP IRR {base_cell.lp_irr:.2%}  "
+                            f"|  GP IRR {base_cell.gp_irr:.2%}"
+                        ),
+                        _ps("bc_val", fontSize=8, textColor=BLACK, leading=11),
+                    ),
+                ]],
+                colWidths=[22 * mm, BODY_W - 22 * mm],
             )
+            callout.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, -1), LIGHT),
+                ("BOX",           (0, 0), (-1, -1), 0.8, NAVY),
+                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 6),
+                ("TOPPADDING",    (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]))
+            story.append(callout)
 
-        self._footer(4)
+        return story
 
     # ------------------------------------------------------------------
     # Recommendation logic
     # ------------------------------------------------------------------
 
     @property
-    def _recommendation(self) -> tuple[str, str, tuple]:
-        irr     = self._dcf.irr
-        dscr    = self._dcf.dscr_year_1
-        em      = self._dcf.equity_multiple
-        status  = self._report.get("overall_status", "OK")
-        severity_rank = {"OK": 0, "INFO": 1, "WARNING": 2, "CRITICAL": 3, "ERROR": 3}
-        sev = severity_rank.get(status, 0)
-
+    def _recommendation(self) -> tuple[str, str, Any]:
+        irr  = self._dcf.irr
+        dscr = self._dcf.dscr_year_1
+        em   = self._dcf.equity_multiple
+        sev  = {"OK": 0, "INFO": 1, "WARNING": 2, "CRITICAL": 3, "ERROR": 3}.get(
+            self._report.get("overall_status", "OK"), 0
+        )
         if sev >= 3 or irr < 0.08 or dscr < 1.10 or em < 1.0:
             return (
                 "SELL",
